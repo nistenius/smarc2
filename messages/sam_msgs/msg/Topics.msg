@@ -59,6 +59,7 @@ string SIDESCAN_STATUS_TOPIC = 'payload/sidescan_status'
 
 #UAVCAN bridge topics
 string GPS_FIX_TOPIC = 'core/can_gps'
+string GPS_TOPIC = 'core/gps'   # NavSatFix GPS (u-blox driver on SAM; also the sim). Distinct from GPS_FIX_TOPIC (the CAN GPS).
 string MAGNETIC_FIELD_TOPIC = 'core/compass'
 string VBS_TANK_TEMPERATURE_TOPIC = 'core/vbs_tank_temperature'
 string ESC_STATUS0_TOPIC = 'core/esc_status0_fb'
