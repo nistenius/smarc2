@@ -18,6 +18,7 @@ from smarc_msgs.msg import Leak, DVL
 # Vehicle specific messages -- Consider how to handle this
 from sam_msgs.msg import Topics as SamTopics
 from diagnostic_msgs.msg import DiagnosticArray
+from std_srvs.srv import Trigger
 
 try:
     from .helpers.health_helpers import TopicRateMonitor
@@ -29,6 +30,10 @@ except ImportError:
 class StatusReport:
     ready: bool = field(default=False)
     fault: bool = field(default=False)
+    # Why this check is unhappy, for the report topic and the log. Empty when healthy.
+    reason: str = field(default="")
+    # Consecutive healthy evaluations, used to debounce recovery when faults don't latch.
+    healthy_streak: int = field(default=0)
 
 
 class MonitorNode(Node):
@@ -82,6 +87,30 @@ class MonitorNode(Node):
 
         self.declare_parameter("report_topic", SmarcTopics.VEHICLE_HEALTH_TOPIC)
         self.report_topic = self.get_parameter("report_topic").value
+
+        # === Fault latching / recovery ===
+        # Historically every fault in this node was permanent: each check starts with
+        # `if status.fault: return status`, and nothing ever set it back to False. On a real
+        # dive that is the right call -- a sensor dropout means surface and investigate, not
+        # carry on because it came back. In simulation it is actively harmful: stopping and
+        # re-playing the Unity editor drops every topic at once, the node latches ERROR, goes
+        # quiet (see fault_logged), and from then on wasp_bt rejects every start-tst with
+        # "vehicle health status is not ok" until someone notices and restarts this process.
+        #
+        # latch_faults=False makes a fault clear itself once the underlying condition has been
+        # good for recover_cycles consecutive evaluations. Default stays True so hardware
+        # behaviour is untouched; sim bringups pass False explicitly.
+        self.declare_parameter("latch_faults", True)
+        self.latch_faults = self.get_parameter("latch_faults").value
+
+        self.declare_parameter("recover_cycles", 3)
+        self.recover_cycles = max(1, int(self.get_parameter("recover_cycles").value))
+
+        # A topic is rate-faulted below desired_rate * rate_tolerance rather than below
+        # desired_rate exactly -- the old comparison had zero headroom, so any jitter under
+        # nominal was a fault, which the 1.0 Hz DVL could not survive.
+        self.declare_parameter("rate_tolerance", 0.8)
+        self.rate_tolerance = float(self.get_parameter("rate_tolerance").value)
 
         self.declare_parameter('verbose', False)
         self.verbose = self.get_parameter("verbose").value
@@ -144,10 +173,20 @@ class MonitorNode(Node):
 
         self.get_logger().info(f"topic rate monitor(s) instantiated")
         self.essential_monitor = TopicRateMonitor(self, self.essential_topics, timeout_time_sec=self.timeout_time_sec,
-                                                  verbose=self.verbose)
+                                                  verbose=self.verbose, latch_faults=self.latch_faults,
+                                                  rate_tolerance=self.rate_tolerance,
+                                                  recover_cycles=self.recover_cycles)
 
         self.optional_monitor = TopicRateMonitor(self, self.optional_topics, timeout_time_sec=self.timeout_time_sec,
-                                                 verbose=self.verbose)
+                                                 verbose=self.verbose, latch_faults=self.latch_faults,
+                                                 rate_tolerance=self.rate_tolerance,
+                                                 recover_cycles=self.recover_cycles)
+
+        # Lets an operator re-arm the vehicle after a transient fault without restarting the
+        # node. Mirrors wasp_bt's own `reset_emergency` service -- clearing that one alone was
+        # never enough, because _handle_tst_command gates start-tst on emergency_flag AND on
+        # health_status separately, and this node owns the second gate.
+        self._reset_faults_srv = self.create_service(Trigger, "reset_faults", self._reset_faults_cb)
 
         if self.testing:
             self.report_pub = self.create_publisher(msg_type=Int8, topic='health_testing', qos_profile=10)
@@ -159,6 +198,68 @@ class MonitorNode(Node):
         self.report_timer = self.create_timer(timer_period_sec=float(1.0 / self.output_rate),
                                               callback=self.output_callback)
         
+
+    def raise_fault(self, status: StatusReport, report: str):
+        """Mark a check faulted, logging only on the healthy -> faulted edge.
+
+        Replaces the old inline pattern of `if self.fault_report is None: self.fault_report = ...`
+        followed by an unconditional warn. That kept the FIRST fault forever and re-logged it on
+        every cycle until fault_logged silenced the node entirely, so the console could never
+        tell you what was wrong *now*.
+        """
+        status.healthy_streak = 0
+        if not status.fault:
+            status.fault = True
+            self.get_logger().warn(report)
+        status.reason = report
+
+    def clear_fault(self, status: StatusReport, label: str):
+        """Called on every evaluation where a check looks healthy.
+
+        Under latch_faults this does nothing -- a fault is terminal. Otherwise the fault clears
+        after recover_cycles consecutive healthy evaluations, so a value hovering on its limit
+        doesn't flap the vehicle in and out of READY.
+        """
+        if not status.fault:
+            status.healthy_streak = 0
+            return
+        if self.latch_faults:
+            return
+        status.healthy_streak += 1
+        if status.healthy_streak >= self.recover_cycles:
+            status.fault = False
+            status.reason = ""
+            status.healthy_streak = 0
+            self.get_logger().info(f"Recovered: {label} is healthy again")
+
+    def _reset_faults_cb(self, request, response):
+        """Clear every latched fault in this node, including inside the rate monitors."""
+        for status in (self.current_leak_status, self.current_battery_status,
+                       self.current_depth_status, self.current_altitude_status):
+            status.fault = False
+            status.reason = ""
+            status.healthy_streak = 0
+        self.essential_monitor.reset_faults()
+        self.optional_monitor.reset_faults()
+        self.fault_report = None
+        self.fault_logged = False
+        response.success = True
+        response.message = "All health faults cleared."
+        self.get_logger().info("All health faults cleared by service call.")
+        return response
+
+    def active_fault_reports(self):
+        """Every fault that is true right now, most useful first."""
+        reports = []
+        for label, status in (("leak", self.current_leak_status),
+                              ("battery", self.current_battery_status),
+                              ("depth", self.current_depth_status),
+                              ("altitude", self.current_altitude_status)):
+            if status.fault:
+                reports.append(status.reason or f"Fault detected: {label}")
+        reports.extend(self.essential_monitor.fault_reasons())
+        reports.extend(self.optional_monitor.fault_reasons())
+        return reports
 
     def leak_callback(self, msg):
         self.current_leak = msg
@@ -177,27 +278,26 @@ class MonitorNode(Node):
         self.current_altitude_time = self.get_clock().now().nanoseconds / 1e9
 
     def leak_check(self):
+        # NOTE: unlike the other checks, a leak never auto-recovers even when latch_faults is
+        # False. Water inside the pressure vessel does not become fine again because the sensor
+        # stopped reporting it -- that is exactly the case where a stale True is the safe read.
         if self.current_leak_status.fault:
             return self.current_leak_status
-        
+
         if self.current_leak is None:
-            return
-        
+            return self.current_leak_status
+
         self.current_leak_status.ready = True
 
         if self.current_leak.value:
-            current_fault_report = f"Fault detected: Leak!"
-            if self.fault_report is None:
-                self.fault_report = current_fault_report
-            self.get_logger().warn(f"Fault detected: Leak!")
-            self.current_leak_status.fault = True
+            self.raise_fault(self.current_leak_status, "Fault detected: Leak!")
 
         return self.current_leak_status
 
     def battery_check(self):
         
         # TODO the batter is not required to move into ready
-        if self.current_battery_status.fault:
+        if self.current_battery_status.fault and self.latch_faults:
             return self.current_battery_status
 
         # check_time = self.get_clock().now().nanoseconds/1e9
@@ -210,19 +310,15 @@ class MonitorNode(Node):
         self.current_battery_status.ready = True
 
         if self.current_battery.voltage < self.battery_min_voltage:
-            current_fault_report = f"Fault detected: Battery low voltage! Current voltage: {self.current_battery.voltage}, Min voltage: {self.battery_min_voltage}"
-            if self.fault_report is None:
-                self.fault_report = current_fault_report
-            
-            self.get_logger().warn(current_fault_report)
-            self.current_battery_status.fault = True
-
-        if self.current_battery.percentage < self.battery_min_capacity:
-            current_fault_report = f"Fault detected: Battery low capacity! Current capacity: {self.current_battery.percentage}, Min capacity: {self.battery_min_capacity}"
-            if self.fault_report is None:
-                self.fault_report = current_fault_report
-            self.get_logger().warn(self.fault_report)
-            self.current_battery_status.fault = True
+            self.raise_fault(
+                self.current_battery_status,
+                f"Fault detected: Battery low voltage! Current voltage: {self.current_battery.voltage}, Min voltage: {self.battery_min_voltage}")
+        elif self.current_battery.percentage < self.battery_min_capacity:
+            self.raise_fault(
+                self.current_battery_status,
+                f"Fault detected: Battery low capacity! Current capacity: {self.current_battery.percentage}, Min capacity: {self.battery_min_capacity}")
+        else:
+            self.clear_fault(self.current_battery_status, "battery")
 
         # if (check_time - self.current_battery_time) > self.timeout_time_sec:
         #     self.get_logger().info(f"Fault detected: Leak time out!")
@@ -232,18 +328,15 @@ class MonitorNode(Node):
 
     def depth_check(self):
 
-        if self.current_depth_status.fault:
+        if self.current_depth_status.fault and self.latch_faults:
             return self.current_depth_status
 
         check_time = self.get_clock().now().nanoseconds/1e9
 
         if self.current_depth is None:
             if self.check_initial_timeout(check_time):
-                current_fault_report = f"Fault detected: depth initial time out!"
-                if self.fault_report is None:
-                    self.fault_report = current_fault_report
-                self.get_logger().warn(current_fault_report)
-                self.current_depth_status.fault = True
+                self.raise_fault(self.current_depth_status,
+                                 "Fault detected: depth initial time out!")
         else:
             self.current_depth_status.ready = True
 
@@ -251,20 +344,17 @@ class MonitorNode(Node):
             if 'max_depth' not in self.limits:
                 return self.current_depth_status
 
-            if self.current_depth.data > self.limits['max_depth']:
-               current_fault_report = f"Fault detected: Max depth exceeded! Current depth: {self.current_depth.data:.2f}, Max depth: {self.limits['max_depth']}"
-               if self.fault_report is None:
-                   self.fault_report = current_fault_report
-               self.get_logger().warn(current_fault_report)
-               self.current_depth_status.fault = True
-
             time_diff = check_time - self.current_depth_time
-            if time_diff > self.timeout_time_sec:
-                current_fault_report = f"Fault detected: depth time out! Time diff = {time_diff:.2f} s > {self.timeout_time_sec:.2f} s"
-                if self.fault_report is None:
-                    self.fault_report = current_fault_report
-                self.get_logger().info(current_fault_report)
-                self.current_depth_status.fault = True
+            if self.current_depth.data > self.limits['max_depth']:
+                self.raise_fault(
+                    self.current_depth_status,
+                    f"Fault detected: Max depth exceeded! Current depth: {self.current_depth.data:.2f}, Max depth: {self.limits['max_depth']}")
+            elif time_diff > self.timeout_time_sec:
+                self.raise_fault(
+                    self.current_depth_status,
+                    f"Fault detected: depth time out! Time diff = {time_diff:.2f} s > {self.timeout_time_sec:.2f} s")
+            else:
+                self.clear_fault(self.current_depth_status, "depth")
 
         return self.current_depth_status
 
@@ -273,37 +363,37 @@ class MonitorNode(Node):
         REMOVED INITIAL
         """
 
-        if self.current_altitude_status.fault:
+        if self.current_altitude_status.fault and self.latch_faults:
             return self.current_altitude_status
 
         check_time = self.get_clock().now().nanoseconds/1e9
 
         if self.current_altitude is None:
             return self.current_altitude_status
-        
+
         self.current_altitude_status.ready = True
 
         # Check that 'max_depth' is defined in limits
         if 'min_altitude' not in self.limits:
             return self.current_altitude_status
-        
+
         if self.current_altitude.data == -1:
+            # -1 is the "no bottom lock" sentinel, not a reading of zero altitude. Treat it as
+            # no information: don't fault on it, but don't count it as a healthy sample towards
+            # recovery either.
             return self.current_altitude_status
 
-        if self.current_altitude.data < self.limits['min_altitude']:
-            current_fault_report = f"Fault detected: low altitude! Current altitude: {self.current_altitude.data:.2f}, Min altitude: {self.limits['min_altitude']}"
-            if self.fault_report is None:
-                self.fault_report = current_fault_report
-            self.get_logger().warn(current_fault_report)
-            self.current_altitude_status.fault = True
-
         time_diff = check_time - self.current_altitude_time
-        if time_diff > self.timeout_time_sec:
-            current_fault_report = f"Fault detected: altitude time out! Time diff = {time_diff:.2f} s > {self.timeout_time_sec:.2f} s"
-            if self.fault_report is None:
-                self.fault_report = current_fault_report
-            self.get_logger().info(current_fault_report)
-            self.current_altitude_status.fault = True
+        if self.current_altitude.data < self.limits['min_altitude']:
+            self.raise_fault(
+                self.current_altitude_status,
+                f"Fault detected: low altitude! Current altitude: {self.current_altitude.data:.2f}, Min altitude: {self.limits['min_altitude']}")
+        elif time_diff > self.timeout_time_sec:
+            self.raise_fault(
+                self.current_altitude_status,
+                f"Fault detected: altitude time out! Time diff = {time_diff:.2f} s > {self.timeout_time_sec:.2f} s")
+        else:
+            self.clear_fault(self.current_altitude_status, "altitude")
 
         return self.current_altitude_status
 
@@ -346,13 +436,31 @@ class MonitorNode(Node):
         ]
 
         if True in faults:
+            # fault_report tracks what is wrong RIGHT NOW rather than whichever fault happened
+            # to land first, so the string published on <report_topic>/report stays useful as
+            # conditions change (and as they clear, when latch_faults is False).
+            active = self.active_fault_reports()
+            self.fault_report = "; ".join(active) if active else self.fault_report
             if not self.fault_logged:
                 self.get_logger().warn(f"Fault detected [essential, optional, leak, battery, altitude, depth]: {faults}")
+                for report in active:
+                    self.get_logger().warn(f"  - {report}")
+                if not self.latch_faults:
+                    self.get_logger().warn(
+                        "Faults are recoverable (latch_faults=False): this will clear itself "
+                        f"after {self.recover_cycles} healthy cycles once the cause goes away.")
                 self.fault_logged = True
             self.publish_fault()
             return
-        
+
+
         elif all(readys) and all(optional_readys):
+            if self.fault_logged:
+                # Re-arm the one-shot logging so the NEXT fault is announced too. Without this
+                # the node would recover and then fail again in silence.
+                self.get_logger().info("All health faults cleared -- vehicle is READY again.")
+                self.fault_logged = False
+                self.fault_report = None
             ready_msg = Int8()
             ready_msg.data = SmarcTopics.VEHICLE_HEALTH_READY
             self.report_pub.publish(ready_msg)

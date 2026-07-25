@@ -10,6 +10,9 @@
   <build_depend>std_msgs</build_depend>
   <build_depend>smarc_msgs</build_depend>
   <build_depend>sam_msgs</build_depend>
+  <!-- std_srvs/Trigger backs the reset_faults service, which lets an operator re-arm the
+       vehicle after a transient fault without restarting this node. -->
+  <depend>std_srvs</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

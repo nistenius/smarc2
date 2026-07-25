@@ -2,6 +2,13 @@
   <!--Launch file for testing the INS -> ODOM, map_odom_initializer_node is used to define odom's fixed transform -->
   <arg name="robot_name" default="sam" />
 
+  <!-- Faults latch by default: on a real dive a sensor dropout means surface and investigate,
+       not carry on because it came back. Sim bringups pass latch_faults:=False so that stopping
+       and re-playing the Unity editor doesn't permanently poison mission acceptance. -->
+  <arg name="latch_faults" default="True" />
+  <arg name="recover_cycles" default="3" />
+  <arg name="rate_tolerance" default="0.8" />
+
   <node pkg="sam_health_checker" exec="sam_rate_health_node" name="sam_rate_health_node" output="screen" namespace="$(var robot_name)">
 <!--     <param name="leak_topic" value="..." /> -->
 <!--     <param name="battery_topic" value="..." /> -->
@@ -10,6 +17,10 @@
 
     <param name="initial_timeout_time_sec" value="60.0" />
     <param name="timeout_time_sec" value="7.5" />
+
+    <param name="latch_faults" value="$(var latch_faults)" />
+    <param name="recover_cycles" value="$(var recover_cycles)" />
+    <param name="rate_tolerance" value="$(var rate_tolerance)" />
 
     <param name="verbose" value="True" />
 

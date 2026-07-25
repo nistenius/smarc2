@@ -30,9 +30,16 @@ if [[ "$(whoami)" == "orin" ]]; then
     REALSIM=real
     MQTT_BROKER_IP=20.240.40.232
     MQTT_BROKER_PORT=1884
+    # On the vehicle a health fault is terminal until a human clears it.
+    LATCH_FAULTS=True
 else
     USE_SIM_TIME=True
     REALSIM=simulation
+    # In the sim, every Unity editor stop/play drops all topics at once. With latching that
+    # left sam_rate_health_node stuck on VEHICLE_HEALTH_ERROR forever, and wasp_bt rejects
+    # every start-tst while health_status != READY -- so a single editor restart silently
+    # blocked all missions until someone restarted the node by hand. Recover instead.
+    LATCH_FAULTS=False
 fi
 
 # Variables for wasp_bt.launch and wasp_mqtt_agent.launch
@@ -70,7 +77,7 @@ CONTROLLER_CMD="ros2 launch sam_diving_controller pid_wp_following.launch robot_
 # EMERGENCY_ACTION_CMD="ros2 launch sam_emergency_action sam_emergency_action.launch robot_name:=$ROBOT_NAME"
 # HEALTH_FAKER_CMD replaced by the real sam_health_checker (uncommented per request 2026-07-24):
 # HEALTH_FAKER_CMD="ros2 topic pub /sam/smarc/vehicle_health std_msgs/msg/Int8 data:\ 0\ "
-HEALTH_CHECKER_CMD="ros2 launch sam_health_checker sam_rate_health_checker.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME"
+HEALTH_CHECKER_CMD="ros2 launch sam_health_checker sam_rate_health_checker.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME latch_faults:=$LATCH_FAULTS"
 DISCOVERY_SERVER_CMD="export ZENOH_CONFIG_OVERRIDE='listen/endpoints=[\"tcp/0.0.0.0:7447\"]' && ros2 run rmw_zenoh_cpp rmw_zenohd"
 tmux_make_layout "$SESSION" bt+cont "
 row(
