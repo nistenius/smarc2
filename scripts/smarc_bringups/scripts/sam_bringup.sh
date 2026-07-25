@@ -12,6 +12,12 @@ SSS_SAVE_PATH=/home/orin/sss_auto_save
 SESSION=${ROBOT_NAME}_bringup
 # check if there is already a tmux session with this name
 if tmux has-session -t $SESSION 2>/dev/null; then
+    # SAM_BRINGUP_IDEMPOTENT=1: VC / unity_bridge re-triggers bringup every power cycle without
+    # requiring a manual tmux kill first (Data Cube Vehicle Control path).
+    if [[ "${SAM_BRINGUP_IDEMPOTENT:-0}" == "1" ]]; then
+        echo "tmux session $SESSION already running — idempotent success."
+        exit 0
+    fi
     echo "There is already a tmux session named $SESSION."
     echo "Please close it before launching this script."
     echo "Exiting."
@@ -62,14 +68,16 @@ col(
 BT_CMD="ros2 launch wasp_bt wasp_bt.launch robot_name:=$ROBOT_NAME agent_type:=$AGENT_TYPE pulse_rate:=$PULSE_RATE use_sim_time:=$USE_SIM_TIME"
 CONTROLLER_CMD="ros2 launch sam_diving_controller pid_wp_following.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME"
 # EMERGENCY_ACTION_CMD="ros2 launch sam_emergency_action sam_emergency_action.launch robot_name:=$ROBOT_NAME"
-HEALTH_FAKER_CMD="ros2 topic pub /sam/smarc/vehicle_health std_msgs/msg/Int8 data:\ 0\ "
+# HEALTH_FAKER_CMD replaced by the real sam_health_checker (uncommented per request 2026-07-24):
+# HEALTH_FAKER_CMD="ros2 topic pub /sam/smarc/vehicle_health std_msgs/msg/Int8 data:\ 0\ "
+HEALTH_CHECKER_CMD="ros2 launch sam_health_checker sam_rate_health_checker.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME"
 DISCOVERY_SERVER_CMD="export ZENOH_CONFIG_OVERRIDE='listen/endpoints=[\"tcp/0.0.0.0:7447\"]' && ros2 run rmw_zenoh_cpp rmw_zenohd"
 tmux_make_layout "$SESSION" bt+cont "
 row(
     var(BT_CMD),
     col(
         2:var(CONTROLLER_CMD),
-        1:var(HEALTH_FAKER_CMD),
+        1:var(HEALTH_CHECKER_CMD),
         1:var(DISCOVERY_SERVER_CMD)
     )
 )"
@@ -90,5 +98,9 @@ row(
 
 # Set default window
 tmux select-window -t $SESSION:0
-# attach to the new session
-tmux -2 attach-session -t $SESSION
+# Attach for interactive use (default). Set SAM_BRINGUP_ATTACH=0 when launched from
+# Data Cube unity_bridge / VC so the script can run without a TTY and leave the
+# session detached (nodes keep running in tmux).
+if [[ "${SAM_BRINGUP_ATTACH:-1}" == "1" ]]; then
+    tmux -2 attach-session -t $SESSION
+fi
