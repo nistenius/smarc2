@@ -2,6 +2,16 @@
   <!--Launch file for testing the INS -> ODOM, map_odom_initializer_node is used to define odom's fixed transform -->
   <arg name="robot_name" default="sam" />
 
+  <!-- DECLARED, because sam_bringup.sh passes use_sim_time:=True and this file did not take it.
+       An undeclared argument does not reach the node, so the health checker was the one process
+       in the sim bringup still running on wall clock. That is not a cosmetic mismatch: topics
+       published at their nominal rate in SIM time arrive slower than nominal in wall clock
+       terms whenever Unity runs below real time, which reads here as a permanent rate fault,
+       and a paused editor reads as an instant timeout. Either way health never reaches READY
+       and wasp_bt refuses every start_tst, with nothing in the log pointing at the clock.
+       Matches how sam_path_planning.launch and the diving controller launches do it. -->
+  <arg name="use_sim_time" default="false" />
+
   <!-- Faults latch by default: on a real dive a sensor dropout means surface and investigate,
        not carry on because it came back. Sim bringups pass latch_faults:=False so that stopping
        and re-playing the Unity editor doesn't permanently poison mission acceptance. -->
@@ -21,6 +31,8 @@
     <param name="latch_faults" value="$(var latch_faults)" />
     <param name="recover_cycles" value="$(var recover_cycles)" />
     <param name="rate_tolerance" value="$(var rate_tolerance)" />
+
+    <param name="use_sim_time" value="$(var use_sim_time)" />
 
     <param name="verbose" value="True" />
 
