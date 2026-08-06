@@ -273,9 +273,20 @@ class WaraPSTaskHandler:
                 msg = String()
                 msg.data = json.dumps(abort_msg)
                 self._wara_ps_tst_feedback_pub.publish(msg)
+                # Retire the timers. A timeout is an EVENT, not a state: having fired once, it must
+                # not stay armed. Leaving them set meant the deadline was still expired after
+                # reset_emergency cleared the flag, so the very next tick raised it again -- and
+                # since the guard above skips this whole block while the flag is up, nothing could
+                # ever clear them. One timed-out mission disabled the vehicle permanently, and the
+                # service written to recover from exactly that could not (2026-08-06).
+                self.mission_start_time = None
+                self.mission_timeout = None
                 return False
-            elif self.tasks_executing == []: # no tasks are executing
+            if self.tasks_executing == []: # no tasks are executing
                 # in the case that a mission was initiated and completed within time, reset mission timer to Nones
+                # `if`, not `elif`: whether to retire a finished mission's timers has nothing to do
+                # with whether the timeout was exceeded -- and the branch above now returns, so an
+                # `elif` here would read as live code that can never run.
                 self.mission_start_time = None
                 self.mission_timeout = None
     
@@ -1004,6 +1015,12 @@ class WaraPSTaskHandler:
 
     def _reset_emergency_cb(self, request, response):
         self.emergency_flag = False
+        # Clear the mission deadline too. An operator clearing an emergency is asking for a clean
+        # slate, and an expired deadline left armed re-raises the flag on the next tick -- which is
+        # what made this service report success and change nothing (2026-08-06). The timeout branch
+        # above now retires its own timers, so this is belt-and-braces rather than the only guard.
+        self.mission_start_time = None
+        self.mission_timeout = None
         response.success = True
         response.message = "Emergency flag set to False."
         self._node.get_logger().info("Emergency flag reset to False by service call.")
