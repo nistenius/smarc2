@@ -236,7 +236,41 @@ check("the window is bounded by window_size",
 check("recover_cycles is floored at 1 so 0 cannot mean 'never recover'",
       monitor(recover_cycles=0)[1].recover_cycles == 1)
 
+
+# --- zero-length sample intervals under sim time (2026-08-05) ---------------------------------
+# `intervals` being non-empty was taken as proof it was safe to divide by its mean. Under
+# use_sim_time several messages share one /clock tick and every interval is 0.0, so the mean is
+# 0.0 -- and sam_rate_health_node exited with ZeroDivisionError on both SAM VMs the moment Unity
+# began publishing. Dying is the worst possible response: the topic loses its publisher entirely,
+# so wasp_bt keeps its initial VEHICLE_HEALTH_ERROR and refuses every mission.
+node, m = monitor(rate=20.0, topics={IMU: [object, 20.0]})
+publish(node, m, IMU, 5, 0.0)              # five samples, all on the same clock tick
+try:
+    reason = m._evaluate_topic(IMU, 20.0)
+    crashed = False
+except ZeroDivisionError:
+    reason, crashed = "ZeroDivisionError", True
+check("identical timestamps do not kill the monitor", not crashed)
+check("identical timestamps are not reported as a rate fault", reason == "")
+
+# The same window, but with the node's own clock well past it, must still time out normally --
+# the guard above must not turn into a way of never faulting.
+node.clock.t += 30.0
+check("a stale topic still times out even with zero-length intervals",
+      "timeout" in m._evaluate_topic(IMU, 20.0))
+
+# One real interval among zeros is still judged on its average, not skipped.
+node, m = monitor(rate=20.0, topics={IMU: [object, 20.0]})
+publish(node, m, IMU, 4, 0.0)
+publish(node, m, IMU, 1, 1.0)              # mean interval 0.2 s -> 5 Hz, well under 20 x 0.8
+check("a genuinely slow topic is still faulted",
+      "rate" in m._evaluate_topic(IMU, 20.0))
+
+# Tallied HERE, immediately before use. It used to be computed right after the last check in the
+# file, which was correct only for as long as nobody appended another one -- and the first person
+# who did (2026-08-05) got two visible FAIL lines, "44/44 passed", and exit code 0.
 fail = [n for n, ok in results if not ok]
+
 print()
 for n, ok in results:
     print(("  PASS  " if ok else "  FAIL  ") + n)

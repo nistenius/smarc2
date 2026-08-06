@@ -179,8 +179,23 @@ class TopicRateMonitor:
 
         # Check frequency
         intervals = [t2 - t1 for t1, t2 in zip(times, list(times)[1:])]
-        if intervals:
-            avg_rate = 1.0 / (sum(intervals) / len(intervals))
+        avg_interval = (sum(intervals) / len(intervals)) if intervals else 0.0
+        # A zero average interval means every sample in the window carries the SAME timestamp.
+        # That is routine under use_sim_time: stamps come from /clock, several messages can arrive
+        # inside one tick, and they are all stamped with it. The old guard was `if intervals:`,
+        # which catches the EMPTY window but not the all-zero one -- so this divided by zero and
+        # killed the process outright, on both SAM VMs within a second of the simulator starting
+        # to publish (2026-08-05).
+        #
+        # A dead health checker is far worse than a faulting one. Faulting, it still publishes
+        # smarc/vehicle_health and an operator can read the reason. Dead, the topic has no
+        # publisher at all, wasp_bt keeps the VEHICLE_HEALTH_ERROR it initialises to, and every
+        # start-tst is refused with nothing anywhere explaining it.
+        #
+        # It is not a fault on the merits either: samples sharing a timestamp arrived at least as
+        # fast as the clock can distinguish, which is the opposite of "below nominal rate".
+        if avg_interval > 0:
+            avg_rate = 1.0 / avg_interval
 
             if self.verbose:
                 self.node.get_logger().info(f"[{topic_name}] Rate: {avg_rate:.2f} Hz / {msg_rate:.2f} Hz")
