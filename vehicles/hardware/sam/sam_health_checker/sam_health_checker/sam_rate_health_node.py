@@ -112,6 +112,21 @@ class MonitorNode(Node):
         self.declare_parameter("rate_tolerance", 0.8)
         self.rate_tolerance = float(self.get_parameter("rate_tolerance").value)
 
+        # How many samples the rate is averaged over. Five -- the value this node has always
+        # used -- spans only 0.17 s at 30 Hz, so the "rate" is really an instantaneous
+        # inter-arrival measure: ONE late message reads as a 50 % rate loss. Worked through at
+        # 30 Hz nominal against a 16 Hz threshold, a single gap of 0.20 s already faults, 0.30 s
+        # reads as 11 Hz, 0.60 s as 6.8 Hz. Combined with the BT's latching abort, one scheduling
+        # hiccup anywhere in the chain ends the mission -- which is what happened on every dive
+        # attempt of 2026-08-07, while the same stream's multi-second average sat at 29.8 Hz.
+        #
+        # A five-sample window cannot tell "the IMU died" from "one message was late", and that
+        # distinction is the entire job of this check. Deliberately left at 5 by default so
+        # hardware behaviour is unchanged and this stays a decision the team makes rather than
+        # one this commit makes for them; sim bringups pass something larger.
+        self.declare_parameter("rate_window_size", 5)
+        self.rate_window_size = max(2, int(self.get_parameter("rate_window_size").value))
+
         self.declare_parameter('verbose', False)
         self.verbose = self.get_parameter("verbose").value
         if self.verbose:
@@ -175,12 +190,14 @@ class MonitorNode(Node):
         self.essential_monitor = TopicRateMonitor(self, self.essential_topics, timeout_time_sec=self.timeout_time_sec,
                                                   verbose=self.verbose, latch_faults=self.latch_faults,
                                                   rate_tolerance=self.rate_tolerance,
-                                                  recover_cycles=self.recover_cycles)
+                                                  recover_cycles=self.recover_cycles,
+                                                  window_size=self.rate_window_size)
 
         self.optional_monitor = TopicRateMonitor(self, self.optional_topics, timeout_time_sec=self.timeout_time_sec,
                                                  verbose=self.verbose, latch_faults=self.latch_faults,
                                                  rate_tolerance=self.rate_tolerance,
-                                                 recover_cycles=self.recover_cycles)
+                                                 recover_cycles=self.recover_cycles,
+                                                 window_size=self.rate_window_size)
 
         # Lets an operator re-arm the vehicle after a transient fault without restarting the
         # node. Mirrors wasp_bt's own `reset_emergency` service -- clearing that one alone was

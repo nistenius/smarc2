@@ -18,6 +18,12 @@
   <arg name="latch_faults" default="True" />
   <arg name="recover_cycles" default="3" />
   <arg name="rate_tolerance" default="0.8" />
+  <!-- Samples the rate is averaged over. At 5 (the long-standing value, kept as the default so
+       hardware behaviour is unchanged) the window spans 0.17 s at 30 Hz, so a SINGLE late message
+       reads as a 50% rate loss: a 0.20 s gap already faults, 0.30 s reads as 11 Hz. That cannot
+       distinguish "the sensor died" from "one message was late". Sim bringups pass a larger
+       value; whether hardware should too is a decision for the team, not for this default. -->
+  <arg name="rate_window_size" default="5" />
 
   <node pkg="sam_health_checker" exec="sam_rate_health_node" name="sam_rate_health_node" output="screen" namespace="$(var robot_name)">
 <!--     <param name="leak_topic" value="..." /> -->
@@ -31,6 +37,7 @@
     <param name="latch_faults" value="$(var latch_faults)" />
     <param name="recover_cycles" value="$(var recover_cycles)" />
     <param name="rate_tolerance" value="$(var rate_tolerance)" />
+    <param name="rate_window_size" value="$(var rate_window_size)" />
 
     <param name="use_sim_time" value="$(var use_sim_time)" />
 

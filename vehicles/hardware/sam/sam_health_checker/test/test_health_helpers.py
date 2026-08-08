@@ -80,7 +80,7 @@ IMU = "/sam/core/imu"
 def monitor(rate=1.0, topics=None, **kw):
     node = FakeNode()
     topics = topics or {DVL: [object, rate]}
-    m = TopicRateMonitor(node, topics, timeout_time_sec=7.5, window_size=5,
+    m = TopicRateMonitor(node, topics, timeout_time_sec=7.5, window_size=kw.pop("window_size", 5),
                          report_interval=1.0, **kw)
     return node, m
 
@@ -264,6 +264,34 @@ node, m = monitor(rate=20.0, topics={IMU: [object, 20.0]})
 publish(node, m, IMU, 4, 0.0)
 publish(node, m, IMU, 1, 1.0)              # mean interval 0.2 s -> 5 Hz, well under 20 x 0.8
 check("a genuinely slow topic is still faulted",
+      "rate" in m._evaluate_topic(IMU, 20.0))
+
+# --- window_size decides whether one late message is a sensor failure (2026-08-07) ------------
+# The window is how many samples the rate is averaged over, and at the default 5 it spans 0.17 s
+# at 30 Hz -- so the "rate" is really an instantaneous inter-arrival measure and a single late
+# message reads as a 50% rate loss. This is not hypothetical: it aborted every dive attempt on
+# 2026-08-07 while the same stream's multi-second average sat at 29.8 Hz.
+#
+# Both cases below are the SAME stream, and the same one the rig actually produces: Unity
+# publishes core/imu at 30 Hz while this node's nominal for it is 20 Hz (fault below 16), with
+# one 0.25 s hiccup. Only the window differs. The headroom between 30 published and 20 expected
+# is precisely what a longer window can spend absorbing a hiccup -- a shorter one cannot.
+def one_hiccup(window):
+    node, m = monitor(rate=20.0, topics={IMU: [object, 20.0]}, window_size=window)
+    publish(node, m, IMU, window - 1, 1.0 / 30.0)   # a healthy 30 Hz stream
+    publish(node, m, IMU, 1, 0.25)                  # one late message
+    return m._evaluate_topic(IMU, 20.0)
+
+check("a 5-sample window calls one 0.25 s hiccup a rate fault (11 Hz -- what aborted every "
+      "dive on 2026-08-07)", "rate" in one_hiccup(5))
+check("a 20-sample window rides the same hiccup out (22 Hz, still above the 16 Hz limit)",
+      one_hiccup(20) == "")
+
+# ...but a genuinely dead sensor must still be caught with the larger window, or we have traded
+# a false positive for a false negative, which is the worse of the two on a real vehicle.
+node, m = monitor(rate=20.0, topics={IMU: [object, 20.0]}, window_size=20)
+publish(node, m, IMU, 20, 0.2)                      # every interval 0.2 s -> a real 5 Hz stream
+check("a 20-sample window still faults a genuinely slow topic",
       "rate" in m._evaluate_topic(IMU, 20.0))
 
 # Tallied HERE, immediately before use. It used to be computed right after the last check in the
