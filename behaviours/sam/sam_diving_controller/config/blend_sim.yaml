@@ -6,3 +6,6 @@
   ros__parameters:
     rpm_u_max: 2500
     rpm_u_min: -1000
+    # 2026-08-10 obstacle-avoidance session: obey the sam_perception obstacle
+    # detector's protective-stop flag. Sim-only; hardware default stays False.
+    blend_obstacle_stop: true

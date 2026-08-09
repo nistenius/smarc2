@@ -113,7 +113,39 @@ class DiveControllerBlendPID(DiveControllerInterface):
         # Low-passed sideslip estimate for course compensation.
         self._beta_lpf = 0.0
 
+        # Protective stop (2026-08-10): subscribe the obstacle detector's stop flag.
+        # Launch-gated (blend_obstacle_stop, default False) so hardware and every
+        # existing launch are bit-for-bit unchanged. On a fresh True flag the surge
+        # reference is forced to zero (the surge PI actively brakes); depth, pitch
+        # and heading loops keep running, so the vehicle holds depth where it is
+        # instead of pinning on the wall with props turning (bags 143736, 165932).
+        self._obstacle_stop_flag = False
+        self._obstacle_stop_stamp = None
+        self._obstacle_stop_logged = False
+        if self.param['blend_obstacle_stop']:
+            from std_msgs.msg import Bool as _Bool
+            self._node.create_subscription(
+                _Bool, self.param['blend_obstacle_stop_topic'],
+                self._obstacle_stop_cb, 1)
+            self._loginfo("Protective stop ENABLED, listening on "
+                          f"{self.param['blend_obstacle_stop_topic']}")
+
         self._loginfo("Blend Dive Controller created")
+
+    def _obstacle_stop_cb(self, msg):
+        self._obstacle_stop_flag = bool(msg.data)
+        self._obstacle_stop_stamp = self._node.get_clock().now()
+
+    def _obstacle_hold(self):
+        """True while a FRESH stop flag is raised. A stale flag (detector dead >2 s)
+        does not hold the vehicle — same fail-open policy as the detector's own
+        watchdog; revisit for hardware (session doc)."""
+        if not self.param['blend_obstacle_stop'] or not self._obstacle_stop_flag:
+            return False
+        if self._obstacle_stop_stamp is None:
+            return False
+        age = (self._node.get_clock().now() - self._obstacle_stop_stamp).nanoseconds * 1e-9
+        return age < 2.0
 
     def _u_cruise_live(self):
         """blend_u_cruise is read live so runs can be set up with `ros2 param set`
@@ -181,6 +213,21 @@ class DiveControllerBlendPID(DiveControllerInterface):
         surge_ref = min(u_cruise,
                         float(np.sqrt(2.0 * a_brake * (current_distance + d_eps))))
         current_surge = self._current_state.twist.twist.linear.x
+
+        # Protective stop: obstacle inside the detector's envelope -> surge ref 0.
+        # The surge PI drives rpm through zero (active braking); VBS/LCG/rudder
+        # loops keep running so depth is held during and after the stop.
+        obstacle_hold = self._obstacle_hold()
+        if obstacle_hold:
+            surge_ref = 0.0
+            if not self._obstacle_stop_logged:
+                self._node.get_logger().warn(
+                    "OBSTACLE PROTECTIVE STOP — surge ref forced to 0, holding depth "
+                    f"(distance to wp {current_distance:.1f} m)")
+                self._obstacle_stop_logged = True
+        elif self._obstacle_stop_logged:
+            self._node.get_logger().info("Obstacle stop cleared — resuming mission")
+            self._obstacle_stop_logged = False
 
         # --- allocation: blend, don't switch --------------------------------------
         w = self._blend_weight(current_surge)
@@ -326,6 +373,8 @@ class DiveControllerBlendPID(DiveControllerInterface):
         # Debug — w is the number that makes "it wobbles" tunable (proposal §7).
         s = f'\nBLEND PID INFO for index {self.traj_index}\n'
         s += f'mode: {self._dive_mode}  w: {w:.2f}  surge: {current_surge:.3f}  surge_ref: {surge_ref:.3f}  u_cruise: {u_cruise:.2f}\n'
+        if obstacle_hold:
+            s += 'OBSTACLE HOLD ACTIVE\n'
         s += f'beta: {np.degrees(self._beta_lpf):.1f} deg  int_released: {self._int_released}  dp_scale: {dp_scale:.2f}\n'
         s += f'depth: {current_depth:.3f}  setpoint: {depth_setpoint:.3f}  error: {depth_error:.3f}\n'
         s += f'pitch: {current_pitch:.3f}  pitch_ref: {pitch_ref:.3f}  dive_pitch: {dive_pitch_setpoint:.3f}\n'

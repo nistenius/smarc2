@@ -68,6 +68,11 @@ class DivingModelParam():
         self._node.declare_parameter('blend_int_holdoff', 0.3)     # m; 0 disables
         self._node.declare_parameter('blend_course_comp', True)    # sideslip comp
         self._node.declare_parameter('blend_dive_pitch_uref', 0.5) # m/s
+        # Protective stop (2026-08-10 obstacle-avoidance session): obey the
+        # sam_perception obstacle detector's stop flag. Default OFF -> hardware and
+        # every existing launch unchanged; blend_sim.yaml turns it on in sim.
+        self._node.declare_parameter('blend_obstacle_stop', False)
+        self._node.declare_parameter('blend_obstacle_stop_topic', 'perception/obstacle/stop')
 
     def get_param(self):
 
@@ -127,5 +132,7 @@ class DivingModelParam():
         param['blend_int_holdoff'] = self._node.get_parameter('blend_int_holdoff').get_parameter_value().double_value
         param['blend_course_comp'] = self._node.get_parameter('blend_course_comp').get_parameter_value().bool_value
         param['blend_dive_pitch_uref'] = self._node.get_parameter('blend_dive_pitch_uref').get_parameter_value().double_value
+        param['blend_obstacle_stop'] = self._node.get_parameter('blend_obstacle_stop').get_parameter_value().bool_value
+        param['blend_obstacle_stop_topic'] = self._node.get_parameter('blend_obstacle_stop_topic').get_parameter_value().string_value
 
         return param

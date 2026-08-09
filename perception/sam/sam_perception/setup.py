@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'perception_monitor = sam_perception.perception_monitor:main',
+            'obstacle_detector = sam_perception.obstacle_detector:main',
         ],
     },
 )

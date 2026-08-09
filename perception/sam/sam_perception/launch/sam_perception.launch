@@ -15,11 +15,20 @@
     <arg name="simulation" default="true"/>
     <arg name="sonar_ip" default="192.168.194.96"/>
 
-    <!-- ==================== SIMULATION: monitor only ==================== -->
+    <!-- ==================== SIMULATION: monitor + obstacle detector ==================== -->
     <group if="$(var simulation)">
         <node name="perception_monitor" pkg="sam_perception" exec="perception_monitor" output="screen">
             <param name="robot_name" value="$(var robot_name)"/>
             <param name="use_sim_time" value="$(var use_sim_time)"/>
+        </node>
+        <!-- Obstacle detector (2026-08-10). body_frame base_link_gt is NOT nav cheating:
+             Unity publishes the cloud in world frame, and only the GT body frame
+             reconstructs the sensor-relative ranges a real sonar measures natively.
+             See the FRAMES note in obstacle_detector.py. -->
+        <node name="obstacle_detector" pkg="sam_perception" exec="obstacle_detector" output="screen">
+            <param name="robot_name" value="$(var robot_name)"/>
+            <param name="use_sim_time" value="$(var use_sim_time)"/>
+            <param name="body_frame" value="base_link_gt"/>
         </node>
     </group>
 
@@ -34,6 +43,14 @@
             <param name="IP" value="$(var sonar_ip)"/>
             <remap from="/sonar3d/point_cloud" to="payload/sonar3d/points"/>
             <remap from="/sonar3d/range_image" to="payload/sonar3d/range_image"/>
+        </node>
+
+        <!-- Obstacle detector on hardware: the driver publishes SENSOR-frame points, so
+             body_frame is plain base_link (static mount transform). NOTE the stale-input
+             policy currently fails OPEN (sim choice) — revisit before confined-water use. -->
+        <node name="obstacle_detector" pkg="sam_perception" exec="obstacle_detector" output="screen">
+            <param name="robot_name" value="$(var robot_name)"/>
+            <param name="body_frame" value="base_link"/>
         </node>
 
         <!-- Intel RealSense D435i via realsense2_camera (IntelRealSense/realsense-ros).
