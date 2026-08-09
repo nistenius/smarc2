@@ -22,6 +22,11 @@
     casc_q_ki: 0.05
     # yaw cascade
     casc_yaw_kp: 0.40        # 0.80 wove (run 142710); halved
+    # v3: gain scheduling + reference shaping (after 143736 instability at 0.7 m/s)
+    casc_sched_uref: 0.5     # gains tuned at this speed; output scaled (uref/u)^2
+    casc_sched_min: 0.15
+    casc_yawref_rate: 0.17   # rad/s heading-ref slew (10 deg/s)
+    casc_use_leg_rpm: true   # mission leg rpm -> cruise (rpm / blend_rpm_kff)
     casc_r_max: 0.26         # 15 deg/s — DVL bottom-lock envelope
     casc_r_kp: 0.40
     casc_r_ki: 0.05

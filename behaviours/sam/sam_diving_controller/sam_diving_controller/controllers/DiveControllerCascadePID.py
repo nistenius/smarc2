@@ -82,12 +82,20 @@ class DiveControllerCascadePID(DiveControllerInterface):
         d('casc_r_max', 0.26)       # rad/s (15 deg/s, DVL bottom-lock envelope)
         d('casc_r_kp', 0.40)        # rudder rad per rad/s
         d('casc_r_ki', 0.05)
+        # v3 (2026-08-09 pm): gain scheduling + reference shaping, after run 143736
+        # went unstable at 0.7 m/s (rudder/stern authority ~ u^2 doubles loop gain).
+        d('casc_sched_uref', 0.5)   # m/s the gains were tuned at
+        d('casc_sched_min', 0.15)   # floor of the (uref/u)^2 schedule
+        d('casc_yawref_rate', 0.17) # rad/s heading-reference slew (10 deg/s)
+        node.declare_parameter('casc_use_leg_rpm', True)  # mission leg rpm -> cruise speed
         g = lambda n: node.get_parameter(n).get_parameter_value().double_value
         self.c = {n: g(n) for n in ('casc_delta_h', 'casc_kappa', 'casc_e_int_max',
                                     'casc_delta_z', 'casc_uref', 'casc_z_ki',
                                     'casc_pitch_kp', 'casc_q_max', 'casc_q_kp',
                                     'casc_q_ki', 'casc_yaw_kp', 'casc_r_max',
-                                    'casc_r_kp', 'casc_r_ki')}
+                                    'casc_r_kp', 'casc_r_ki', 'casc_sched_uref',
+                                    'casc_sched_min', 'casc_yawref_rate')}
+        self._use_leg_rpm = node.get_parameter('casc_use_leg_rpm').get_parameter_value().bool_value
 
         # --- inner-loop PIDs ------------------------------------------------------
         tv_lim = self.param['tv_u_max']
@@ -114,6 +122,7 @@ class DiveControllerCascadePID(DiveControllerInterface):
         self._leg_pure_pursuit = False
         self._e_int = 0.0            # ILOS integrator
         self._beta_lpf = 0.0
+        self._yaw_ref_slewed = None  # rate-limited heading reference
 
         self._loginfo("Cascade Dive Controller created")
 
@@ -163,6 +172,7 @@ class DiveControllerCascadePID(DiveControllerInterface):
             self._loginfo_once(f"Mission {mission_state} — actuators neutral")
             self._set_actuators_neutral()
             self._leg_wp = None
+            self._yaw_ref_slewed = None
             return
 
         self._dive_pub.set_actuator_states(ActuatorStates.ENGAGED, "DP")
@@ -200,7 +210,17 @@ class DiveControllerCascadePID(DiveControllerInterface):
         w = self._blend_weight(u_meas)
 
         # ================= SPEED =================================================
+        # Per-leg speed: the mission's leg rpm maps to a cruise speed through the
+        # measured kff (650 rpm -> 0.5 m/s, 1300 -> 1.0). Falls back to the live
+        # blend_u_cruise parameter when the mission carries no usable rpm.
         u_cruise = self._u_cruise_live()
+        if self._use_leg_rpm:
+            try:
+                rpm_sp = self._dive_sub.get_rpm_setpoint()
+                if rpm_sp is not None and rpm_sp > 0:
+                    u_cruise = float(rpm_sp) / max(self.param['blend_rpm_kff'], 1.0)
+            except AttributeError:
+                pass
         a_brake = self.param['blend_a_brake']
         surge_ref = min(u_cruise, float(np.sqrt(2.0 * a_brake * (current_distance + 0.5))))
         pi_trim, surge_error, _ = self._surge_rpm_pid.get_control(u_meas, surge_ref, self._dt)
@@ -230,12 +250,28 @@ class DiveControllerCascadePID(DiveControllerInterface):
         if abs(u_meas) > 0.15:
             beta = float(np.clip(np.arctan2(v_meas, u_meas), -0.35, 0.35))
             self._beta_lpf += (beta - self._beta_lpf) * min(1.0, self._dt / 2.0)
-        yaw_ref = chi_d - self._beta_lpf
+        yaw_ref_target = chi_d - self._beta_lpf
+
+        # Heading-reference rate limit: the 90+ deg step at mission start at speed is
+        # what kicked the 143736 oscillation. Slew the reference, wrap-aware.
+        if self._yaw_ref_slewed is None:
+            self._yaw_ref_slewed = current_heading
+        step = self.c['casc_yawref_rate'] * self._dt
+        diff = _wrap(yaw_ref_target - self._yaw_ref_slewed)
+        self._yaw_ref_slewed = _wrap(self._yaw_ref_slewed + float(np.clip(diff, -step, step)))
+        yaw_ref = self._yaw_ref_slewed
+
+        # Gain schedule: rudder/stern authority ~ u^2, so scale the cascade output
+        # by (uref/u)^2 (clamped) to keep loop gain speed-invariant.
+        sched = float(np.clip((self.c['casc_sched_uref'] / max(abs(u_meas), self.c['casc_sched_uref'])) ** 2,
+                              self.c['casc_sched_min'], 1.0))
 
         yaw_error = _wrap(yaw_ref - current_heading)
         r_ref = float(np.clip(self.c['casc_yaw_kp'] * yaw_error,
                               -self.c['casc_r_max'], self.c['casc_r_max']))
-        u_tv_rudder, _, _ = self._r_pid.get_control(r_meas, r_ref, self._dt)
+        u_r_out, _, _ = self._r_pid.get_control(r_meas, r_ref, self._dt)
+        tv_lim = self.param['tv_u_max']
+        u_tv_rudder = float(np.clip(sched * float(u_r_out), -tv_lim, tv_lim))
 
         # ================= VERTICAL: depth -> pitch -> q -> stern ================
         depth_error = depth_setpoint - current_depth
@@ -255,7 +291,8 @@ class DiveControllerCascadePID(DiveControllerInterface):
         q_ref = float(np.clip(self.c['casc_pitch_kp'] * pitch_error,
                               -self.c['casc_q_max'], self.c['casc_q_max']))
         u_q, _, _ = self._q_pid.get_control(q_meas, q_ref, self._dt)
-        u_tv_stern = -float(u_q) * w  # stern authority ~ u^2; gate by w. Sign per stock.
+        # stern: gate by w near hover, gain-schedule at speed. Sign per stock.
+        u_tv_stern = float(np.clip(-float(u_q) * w * sched, -tv_lim, tv_lim))
 
         # ================= ALLOCATION: speed-nested VBS / LCG ====================
         # integral (trim) always active; P-effort fades with speed.
@@ -312,7 +349,7 @@ class DiveControllerCascadePID(DiveControllerInterface):
             self.traj_index += 1
         self._dive_sub.set_current_idx(self.traj_index)
 
-        s = f'\nCASCADE PID INFO idx {self.traj_index}  mode: {mode}  w: {w:.2f}\n'
+        s = f'\nCASCADE PID INFO idx {self.traj_index}  mode: {mode}  w: {w:.2f}  sched: {sched:.2f}\n'
         s += f'xtrack: {e_ct:+.2f} m (int {self._e_int:+.2f})  chi_d: {np.degrees(chi_d):.1f}  beta: {np.degrees(self._beta_lpf):+.1f} deg\n'
         s += f'yaw err: {np.degrees(yaw_error):+.1f} deg  r: {np.degrees(r_meas):+.1f}->{np.degrees(r_ref):+.1f} deg/s  rudder: {u_tv_rudder:+.3f}\n'
         s += f'depth: {current_depth:.2f}/{depth_setpoint:.2f}  z_int: {np.degrees(self._z_int):+.1f} deg  pitch: {np.degrees(current_pitch):+.1f}->{np.degrees(pitch_ref):+.1f} deg\n'
