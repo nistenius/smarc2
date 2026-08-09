@@ -1,24 +1,24 @@
 <launch>
 
-    <!-- Blend-allocation dive controller (Session C, 2026-08-09). Drop-in alternative
-         to pid_wp_following.launch: same action name by default, so the BT needs no
-         change for an A/B. Set dive_action_name to run alongside the stock PID as a
-         second server for BT-level controller switching. -->
+    <!-- Cascaded-PID dive controller (Session C part 3, 2026-08-09).
+         Cross-track ILOS -> heading -> yaw-rate; depth -> pitch -> pitch-rate;
+         speed-nested VBS/LCG. Tuning: config/cascade_pid.yaml.
+         SIM NOTE: rpm limits are unlocked here per Ivan (hardware caps stay in the
+         stock launch/config): 800 -> 2500 rpm, measured k ~ 1300 rpm per m/s. -->
     <arg name="robot_name" default="sam0"/>
     <arg name="tf_suffix" default=""/>
     <arg name="use_sim_time" default="false"/>
     <arg name="dive_action_name" default="auv_depth_move_to"/>
     <arg name="control_yaml" default="$(find-pkg-share sam_diving_controller)/config/sam_diving_controller_config.yaml"/>
-    <arg name="blend_sim_yaml" default="$(find-pkg-share sam_diving_controller)/config/blend_sim.yaml"/>
+    <arg name="cascade_yaml" default="$(find-pkg-share sam_diving_controller)/config/cascade_pid.yaml"/>
 
     <group>
     <push-ros-namespace namespace="$(var robot_name)"/>
-       <node name="diving_node" pkg="sam_diving_controller" exec="blend_pid_wp_following" output="screen">
+       <node name="diving_node" pkg="sam_diving_controller" exec="cascade_pid_wp_following" output="screen">
         <param name="robot_name" value="$(var robot_name)"/>
         <param name="tf_suffix" value="$(var tf_suffix)"/>
 	<param from="$(var control_yaml)"/>
-	<!-- SIM rpm unlock (2026-08-09, Ivan): later file wins; hardware caps stay in stock -->
-	<param from="$(var blend_sim_yaml)"/>
+	<param from="$(var cascade_yaml)"/>
 	<param name="use_sim_time" value="$(var use_sim_time)" />
 	<param name="dive_action_name" value="$(var dive_action_name)" />
 	<param name="target_frame" value="base_link" />

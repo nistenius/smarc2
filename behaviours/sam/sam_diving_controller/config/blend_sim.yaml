@@ -1,0 +1,8 @@
+---
+# Blend controller sim overrides (2026-08-09): rpm unlock per Ivan.
+# Loaded on top of the main config by blend_pid_wp_following.launch.
+# Hardware caps stay in the stock launch/config.
+/*/diving_node:
+  ros__parameters:
+    rpm_u_max: 2500
+    rpm_u_min: -1000

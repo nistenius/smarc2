@@ -14,6 +14,7 @@ from .ConveniencePub import ConveniencePub
 
 from .controllers.DiveControllerPID import DiveControllerPID
 from .controllers.DiveControllerBlendPID import DiveControllerBlendPID
+from .controllers.DiveControllerCascadePID import DiveControllerCascadePID
 
 from .controllers.DiveControllerJoyPID import DiveControllerJoyPID
 
@@ -113,6 +114,31 @@ def _build_blend_pid_wp_following(node, rates: Rates) -> Components:
         convenience_pub=convenience_pub,
     )
 
+def _build_cascade_pid_wp_following(node, rates: Rates) -> Components:
+    """
+    Session C part 3 (2026-08-09): triple-cascade controller (cross-track ILOS ->
+    heading -> yaw-rate; depth -> pitch -> pitch-rate; speed-nested VBS/LCG).
+    Same server pattern as the blend controller; tuning in config/cascade_pid.yaml.
+    """
+    param = DivingModelParam(node).get_param()
+    action_type = ActionType(BaseAction)
+    heartbeat_topic = SMaRCTopics.WARA_PS_ACTION_SERVER_HB_TOPIC
+
+    node.declare_parameter('dive_action_name', 'auv_depth_move_to')
+    action_name = node.get_parameter('dive_action_name').get_parameter_value().string_value
+
+    dive_sub = DiveActionServerSub(node, action_name, action_type, param, heartbeat_topic)
+    dive_pub = DivePub(node, dive_sub, param)
+    dive_controller = DiveControllerCascadePID(node, dive_pub, dive_sub, param, rates.dive_controller)
+    convenience_pub = ConveniencePub(node, dive_sub, dive_controller)
+
+    return Components(
+        dive_pub=dive_pub,
+        dive_controller=dive_controller,
+        dive_sub=dive_sub,
+        convenience_pub=convenience_pub,
+    )
+
 def _build_pid_trajectory_tracking(node, rates: Rates) -> Components:
     param = DivingModelParam(node).get_param()
     action_type = ActionType(BaseAction)
@@ -184,6 +210,11 @@ def blend_pid_wp_following():
     run_mode(node_name="BlendPidWpFollowingNode",
              build=_build_blend_pid_wp_following,
              log_banner="Blend PID Waypoint Following")
+
+def cascade_pid_wp_following():
+    run_mode(node_name="CascadePidWpFollowingNode",
+             build=_build_cascade_pid_wp_following,
+             log_banner="Cascade PID Waypoint Following")
 
 def pid_trajectory_tracking():
     run_mode(node_name="PidTrajectoryTrackingNode",

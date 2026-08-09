@@ -6,6 +6,28 @@ Listens to the BT for waypoints and follows them. It chooses between active,
 i.e. using the thrusters, and static diving, i.e. using LCG amd VBS based on
 the distance to the waypoint.
 
+## The controller family (2026-08-09)
+
+Four interchangeable controller designs behind `DiveControllerInterface`, each a
+self-contained package (controller class + launch file + tuning yaml) selectable at
+launch — `SAM_DIVE_LAUNCH=<launch name> sam_bringup.sh` — or run side by side under
+distinct action names (`dive_action_name` parameter) for BT-level switching:
+
+| design | exec / launch | tuning | character |
+|---|---|---|---|
+| **Stock PID** | `pid_wp_following` | `sam_diving_controller_config.yaml` | mode-switching static/active. Known defect: parks 0.5 m shallow (limit cycle, measured 2026-08-07/09). Kept bit-for-bit as the baseline & hardware default. |
+| **Blend PID** | `blend_pid_wp_following` | main config `blend_*` params | no modes: VBS depth-PI always on (integral = trim), stern authority ~ speed blend `w`, velocity controller (`blend_u_cruise` live-settable), sideslip comp, integral hold-off v2. Verified 2026-08-09 (runs `12xxxx`/`13xxxx`). |
+| **Cascade PID** | `cascade_pid_wp_following` | `config/cascade_pid.yaml` | cross-track ILOS → heading → yaw-rate and depth → pitch → pitch-rate triple cascades; VBS/LCG carry (1−w)-weighted effort (dominant near hover, fading at cruise) with always-on trim integrals; slow outer depth integral for the standing-bias. |
+| **MPC** | `mpc_wp_following` / `mpc_trajectory_tracking` | in-class | the group's NMPC (tank-test rosbags); most advanced, swaps in behind the same interface. |
+
+Sim-only note: the blend and cascade launch files unlock the rpm limits
+(800 → 2500; measured k ≈ 1300 rpm per m/s so 1.5 m/s needs ~2000 rpm). The stock
+launch keeps hardware caps.
+
+Measured history and A/B methodology: `data-cube/docs/2026-08-09-session-c-dive-blend.md`
+(sibling repo), analysis via `data-cube/scripts/analyze_depth_hold.py` on
+`fly_mission.sh` run directories.
+
 ## Launch Files
 
 We have two launch files:

@@ -1,0 +1,27 @@
+---
+# DiveControllerCascadePID — this controller's own tuning package (2026-08-09).
+# Loaded on top of sam_diving_controller_config.yaml by cascade_pid_wp_following.launch.
+# Defaults are also declared in the controller; this file is the returnable record.
+/*/diving_node:
+  ros__parameters:
+    # SIM rpm unlock (2026-08-09, Ivan): hardware caps stay in the stock config.
+    # Measured k ~ 1300 rpm per m/s -> 1.5 m/s needs ~2000 rpm.
+    rpm_u_max: 2500
+    rpm_u_min: -1000
+    # guidance (ILOS)
+    casc_delta_h: 8.0        # m horizontal lookahead; 5.0 wove +/-10-15 deg (run 142710)
+    casc_kappa: 0.03         # ILOS integral gain
+    casc_e_int_max: 5.0
+    casc_delta_z: 3.0        # m vertical lookahead at/below casc_uref
+    casc_uref: 0.5           # m/s; lookahead scales with speed above this
+    casc_z_ki: 0.02          # slow outer depth integral — kills the 0.2 m bias
+    # pitch cascade
+    casc_pitch_kp: 1.5
+    casc_q_max: 0.30         # rad/s
+    casc_q_kp: 0.30
+    casc_q_ki: 0.05
+    # yaw cascade
+    casc_yaw_kp: 0.40        # 0.80 wove (run 142710); halved
+    casc_r_max: 0.26         # 15 deg/s — DVL bottom-lock envelope
+    casc_r_kp: 0.40
+    casc_r_ki: 0.05
