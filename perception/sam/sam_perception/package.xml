@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sam_perception</name>
+  <version>0.0.1</version>
+  <description>
+    Perception sensor bringup for SAM 2.2: WaterLinked Sonar 3D-15 + Intel RealSense D435i.
+    In simulation the topics come from Unity (sam2.2 prefab) over the ros_tcp bridge and this
+    package runs a rate monitor; on hardware it launches the actual drivers remapped into the
+    same topic names, so downstream consumers are identical in sim and reality.
+  </description>
+  <maintainer email="stenius@kth.se">Ivan Stenius</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+
+  <!-- Hardware-only (not required to build; launched if present):
+       sonar3d          - github.com/waterlinked/Sonar-3D-15-ROS-driver
+       realsense2_camera - github.com/IntelRealSense/realsense-ros -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

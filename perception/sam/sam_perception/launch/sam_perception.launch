@@ -1,0 +1,55 @@
+<launch>
+
+    <!-- SAM 2.2 perception sensors (2026-08-09).
+         simulation:=true  (default) - Unity's sam2.2 prefab publishes the topics over the
+                            ros_tcp bridge; we only run a rate monitor so the bringup shows
+                            whether sim data is actually flowing.
+         simulation:=false - launch the real drivers, remapped into the same topic names the
+                            sim uses, so downstream consumers are identical:
+                              <robot>/payload/sonar3d/points     sensor_msgs/PointCloud2
+                              <robot>/payload/realsense/...      images + camera_info
+                            NOTE: the hardware branch is written to spec but has NOT been
+                            run against real units yet - verify remaps on first bench test. -->
+    <arg name="robot_name" default="sam_auv_v1"/>
+    <arg name="use_sim_time" default="false"/>
+    <arg name="simulation" default="true"/>
+    <arg name="sonar_ip" default="192.168.194.96"/>
+
+    <!-- ==================== SIMULATION: monitor only ==================== -->
+    <group if="$(var simulation)">
+        <node name="perception_monitor" pkg="sam_perception" exec="perception_monitor" output="screen">
+            <param name="robot_name" value="$(var robot_name)"/>
+            <param name="use_sim_time" value="$(var use_sim_time)"/>
+        </node>
+    </group>
+
+    <!-- ==================== HARDWARE: real drivers ==================== -->
+    <group unless="$(var simulation)">
+        <push-ros-namespace namespace="$(var robot_name)"/>
+
+        <!-- WaterLinked Sonar 3D-15: RIP1 UDP multicast -> PointCloud2.
+             Driver: github.com/waterlinked/Sonar-3D-15-ROS-driver (pkg 'sonar3d').
+             Driver-native topics are remapped to the sim-identical names. -->
+        <node name="sonar3d" pkg="sonar3d" exec="multicast_listener" output="screen">
+            <param name="IP" value="$(var sonar_ip)"/>
+            <remap from="/sonar3d/point_cloud" to="payload/sonar3d/points"/>
+            <remap from="/sonar3d/range_image" to="payload/sonar3d/range_image"/>
+        </node>
+
+        <!-- Intel RealSense D435i via realsense2_camera (IntelRealSense/realsense-ros).
+             Stereo IR pair + depth, aligned with what the sim publishes. The driver's
+             infra1/infra2 are the left/right imagers (left = depth frame). -->
+        <include file="$(find-pkg-share realsense2_camera)/launch/rs_launch.py">
+            <arg name="camera_name" value="realsense"/>
+            <arg name="camera_namespace" value="$(var robot_name)/payload"/>
+            <arg name="enable_infra1" value="true"/>
+            <arg name="enable_infra2" value="true"/>
+            <arg name="enable_depth" value="true"/>
+            <arg name="enable_color" value="false"/>
+            <arg name="enable_gyro" value="true"/>
+            <arg name="enable_accel" value="true"/>
+            <arg name="depth_module.profile" value="848x480x15"/>
+        </include>
+    </group>
+
+</launch>

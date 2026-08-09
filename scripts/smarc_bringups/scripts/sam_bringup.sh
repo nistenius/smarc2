@@ -130,11 +130,31 @@ SMARC_PUB_CMD="ros2 launch sam_smarc_publisher default.launch robot_name:=$ROBOT
 MQTT_BRIDGE_CMD="ros2 launch str_json_mqtt_bridge waraps_bridge.launch broker_addr:=$MQTT_BROKER_IP broker_port:=$MQTT_BROKER_PORT robot_name:=$ROBOT_NAME domain:=subsurface context:=isee realsim:=$REALSIM use_sim_time:=$USE_SIM_TIME"
 # HEALTH_CHECKER_CMD="ros2 launch sam_health_checker sam_rate_health_checker.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME"
 # UTILS_CMD="ros2 launch smarc_bringups utilities.launch robot_name:=$ROBOT_NAME"
-tmux_make_layout "$SESSION" utils "
+
+# SAM 2.2 perception (2026-08-09): Sonar 3D-15 + RealSense D435i. In sim this pane is a
+# rate monitor of the Unity-published topics (one glance answers "is sim data flowing?");
+# on hardware it launches the real drivers remapped to the sim-identical topic names.
+# Disable with SAM_PERCEPTION=0 (e.g. when flying the old sam_auv_v1 prefab, whose
+# missing perception topics would just be SILENT log noise).
+if [[ $USE_SIM_TIME == "True" ]]; then PERCEPTION_SIM=true; else PERCEPTION_SIM=false; fi
+PERCEPTION_CMD="ros2 launch sam_perception sam_perception.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME simulation:=$PERCEPTION_SIM"
+
+if [[ "${SAM_PERCEPTION:-1}" == "1" ]]; then
+    tmux_make_layout "$SESSION" utils "
+row(
+    var(MQTT_BRIDGE_CMD),
+    col(
+        var(SMARC_PUB_CMD),
+        var(PERCEPTION_CMD)
+    )
+)"
+else
+    tmux_make_layout "$SESSION" utils "
 row(
     var(MQTT_BRIDGE_CMD),
     var(SMARC_PUB_CMD)
 )"
+fi
 
 
 
