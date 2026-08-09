@@ -32,14 +32,41 @@ if [[ "$(whoami)" == "orin" ]]; then
     MQTT_BROKER_PORT=1884
     # On the vehicle a health fault is terminal until a human clears it.
     LATCH_FAULTS=True
+    # Hardware: estimator keeps its long-standing config and ignores message covariances.
+    DR_SENSOR_ARGS="config_file:=sam.yaml use_sensor_covariance:=false"
+    DR_ENV=""
+    # Hardware keeps the long-standing 5-sample window; changing it is a team decision.
+    RATE_WINDOW_SIZE=5
+    DR_STRATEGY=FixedLagSmoothing
 else
     USE_SIM_TIME=True
     REALSIM=simulation
+    # Sim (2026-08-08, sim fidelity work): Unity sensors now publish measured noise and real
+    # covariances. sam.yaml's sigmas (DVL 1e-5, GPS 1 mm) were tuned for the old noiseless sim
+    # and are wildly overconfident against noisy data; sim.yaml is sane, and
+    # use_sensor_covariance:=true takes DVL/GPS sigmas from the messages themselves.
+    DR_SENSOR_ARGS="config_file:=sim.yaml use_sensor_covariance:=true"
+    # The VM's GTSAM lives in /usr/local; without this the loader picks apt's 4.2 and the
+    # estimator dies with undefined symbol GPSFactorArm (2026-08-07 session note).
+    # PREPEND, don't replace: clobbering LD_LIBRARY_PATH hides the ROS libs themselves
+    # (librcl_action.so ImportError). Escaped so it expands in the tmux pane, not here.
+    DR_ENV="LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH "
     # In the sim, every Unity editor stop/play drops all topics at once. With latching that
     # left sam_rate_health_node stuck on VEHICLE_HEALTH_ERROR forever, and wasp_bt rejects
     # every start-tst while health_status != READY -- so a single editor restart silently
     # blocked all missions until someone restarted the node by hand. Recover instead.
     LATCH_FAULTS=False
+    # Unity editor hitches pause every topic together; a 5-sample window cannot tell that
+    # apart from a dead sensor. 20 samples spans ~0.7 s at 30 Hz, which rides out a hitch
+    # while still catching a sensor that actually stopped.
+    RATE_WINDOW_SIZE=20
+    # 2026-08-08: with FixedLagSmoothing(100 s) the initial prior ages out of the window.
+    # Underwater the sim has NO absolute constraint (no GPS fix, no compass factor), so once
+    # the prior is gone yaw and horizontal position are unobservable -- the graph becomes
+    # underdetermined and GTSAM throws IndeterminantLinearSystemException and kills the node.
+    # That is what ended the first honest run. ISAM2 keeps every variable (and therefore the
+    # prior) while still updating incrementally. Override with DR_STRATEGY=... to compare.
+    DR_STRATEGY=${DR_STRATEGY:-ISAM2}
 fi
 
 # Variables for wasp_bt.launch and wasp_mqtt_agent.launch
@@ -64,7 +91,7 @@ if [[ $USE_SIM_TIME == "False" ]]; then
 fi
 
 DESCRIPTION_CMD="ros2 launch sam_description sam_description.launch robot_name:=$ROBOT_NAME"
-DR_CMD="ros2 launch hydrobatic_localization state_estimator.launch robot_name:=$ROBOT_NAME  use_motion_model:=false inference_strategy:=FixedLagSmoothing kf_interval_hz:=10 use_sensor_covariance:=false init_from_ground_truth:=false"
+DR_CMD="${DR_ENV}ros2 launch hydrobatic_localization state_estimator.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME use_motion_model:=false inference_strategy:=$DR_STRATEGY kf_interval_hz:=10 $DR_SENSOR_ARGS init_from_ground_truth:=false"
 
 tmux_make_layout "$SESSION" dr "
 col(
@@ -77,7 +104,13 @@ CONTROLLER_CMD="ros2 launch sam_diving_controller pid_wp_following.launch robot_
 # EMERGENCY_ACTION_CMD="ros2 launch sam_emergency_action sam_emergency_action.launch robot_name:=$ROBOT_NAME"
 # HEALTH_FAKER_CMD replaced by the real sam_health_checker (uncommented per request 2026-07-24):
 # HEALTH_FAKER_CMD="ros2 topic pub /sam/smarc/vehicle_health std_msgs/msg/Int8 data:\ 0\ "
-HEALTH_CHECKER_CMD="ros2 launch sam_health_checker sam_rate_health_checker.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME latch_faults:=$LATCH_FAULTS"
+# rate_window_size: the 2026-08-07 session concluded sim needs 20 and hardware keeps 5, but
+# nothing ever passed it -- so every sim run since has been aborting on single late messages.
+# At the default 5 the window spans 0.17 s at 30 Hz: one hiccup reads as a 50 % rate loss,
+# health goes ERROR for a tick, the BT raises the emergency flag and cancels the mission.
+# That is exactly what killed the 2026-08-08 noisy-sensor run at t+10 s (IMU measured
+# 23.98 Hz against a 20 Hz nominal, i.e. healthy on average and faulting on jitter).
+HEALTH_CHECKER_CMD="ros2 launch sam_health_checker sam_rate_health_checker.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME latch_faults:=$LATCH_FAULTS rate_window_size:=$RATE_WINDOW_SIZE"
 DISCOVERY_SERVER_CMD="export ZENOH_CONFIG_OVERRIDE='listen/endpoints=[\"tcp/0.0.0.0:7447\"]' && ros2 run rmw_zenoh_cpp rmw_zenohd"
 tmux_make_layout "$SESSION" bt+cont "
 row(
