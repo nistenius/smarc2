@@ -36,3 +36,9 @@
     rpm_u_min: -400
     rpm_u_max: 800
     max_dive_pitch: 0.349
+    blend_u_lo: 0.2
+    blend_u_hi: 0.6
+    blend_vbs_kp: 20.0
+    blend_vbs_ki: 0.5
+    blend_vbs_kd: 0.0
+    blend_vbs_slew: 5.0

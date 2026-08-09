@@ -100,7 +100,11 @@ col(
 )"
 
 BT_CMD="ros2 launch wasp_bt wasp_bt.launch robot_name:=$ROBOT_NAME agent_type:=$AGENT_TYPE pulse_rate:=$PULSE_RATE use_sim_time:=$USE_SIM_TIME"
-CONTROLLER_CMD="ros2 launch sam_diving_controller pid_wp_following.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME"
+# Controller selection (Session C, 2026-08-09): SAM_DIVE_LAUNCH picks the dive
+# controller launch file. Default = stock PID, unchanged behaviour.
+#   SAM_DIVE_LAUNCH=blend_pid_wp_following ... sam_bringup.sh   -> blend controller A/B
+DIVE_LAUNCH="${SAM_DIVE_LAUNCH:-pid_wp_following}"
+CONTROLLER_CMD="ros2 launch sam_diving_controller ${DIVE_LAUNCH}.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME"
 # EMERGENCY_ACTION_CMD="ros2 launch sam_emergency_action sam_emergency_action.launch robot_name:=$ROBOT_NAME"
 # HEALTH_FAKER_CMD replaced by the real sam_health_checker (uncommented per request 2026-07-24):
 # HEALTH_FAKER_CMD="ros2 topic pub /sam/smarc/vehicle_health std_msgs/msg/Int8 data:\ 0\ "

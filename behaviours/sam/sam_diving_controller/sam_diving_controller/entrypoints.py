@@ -13,6 +13,7 @@ from .DivePub import DivePub
 from .ConveniencePub import ConveniencePub
 
 from .controllers.DiveControllerPID import DiveControllerPID
+from .controllers.DiveControllerBlendPID import DiveControllerBlendPID
 
 from .controllers.DiveControllerJoyPID import DiveControllerJoyPID
 
@@ -74,6 +75,35 @@ def _build_pid_wp_following(node, rates: Rates) -> Components:
     dive_sub = DiveActionServerSub(node, "auv_depth_move_to", action_type, param, heartbeat_topic)
     dive_pub = DivePub(node, dive_sub, param)
     dive_controller = DiveControllerPID(node, dive_pub, dive_sub, param, rates.dive_controller)
+    convenience_pub = ConveniencePub(node, dive_sub, dive_controller)
+
+    return Components(
+        dive_pub=dive_pub,
+        dive_controller=dive_controller,
+        dive_sub=dive_sub,
+        convenience_pub=convenience_pub,
+    )
+
+def _build_blend_pid_wp_following(node, rates: Rates) -> Components:
+    """
+    Session C (2026-08-09): the blend-allocation controller as a SEPARATE server, so
+    BT/MC can switch controllers per mission (or mid-mission) and A/B them.
+
+    The action name is a parameter. Default is the same "auv_depth_move_to" the stock
+    PID serves, so swapping the executable in the bringup launch is a drop-in A/B with
+    no BT change. To run BOTH servers side by side for BT-level switching, launch this
+    one with dive_action_name:=auv_depth_move_to_blend and give the BT a client for it.
+    """
+    param = DivingModelParam(node).get_param()
+    action_type = ActionType(BaseAction)
+    heartbeat_topic = SMaRCTopics.WARA_PS_ACTION_SERVER_HB_TOPIC
+
+    node.declare_parameter('dive_action_name', 'auv_depth_move_to')
+    action_name = node.get_parameter('dive_action_name').get_parameter_value().string_value
+
+    dive_sub = DiveActionServerSub(node, action_name, action_type, param, heartbeat_topic)
+    dive_pub = DivePub(node, dive_sub, param)
+    dive_controller = DiveControllerBlendPID(node, dive_pub, dive_sub, param, rates.dive_controller)
     convenience_pub = ConveniencePub(node, dive_sub, dive_controller)
 
     return Components(
@@ -149,6 +179,11 @@ def pid_wp_following():
     run_mode(node_name="PidWpFollowingNode", 
              build=_build_pid_wp_following,
              log_banner="PID Waypoint Following")
+
+def blend_pid_wp_following():
+    run_mode(node_name="BlendPidWpFollowingNode",
+             build=_build_blend_pid_wp_following,
+             log_banner="Blend PID Waypoint Following")
 
 def pid_trajectory_tracking():
     run_mode(node_name="PidTrajectoryTrackingNode",

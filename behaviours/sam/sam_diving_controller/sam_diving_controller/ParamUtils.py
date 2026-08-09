@@ -51,6 +51,17 @@ class DivingModelParam():
 
         self._node.declare_parameter('max_dive_pitch', 0.349)
 
+        # Blend allocation (DiveControllerBlendPID only; ignored by the stock PID).
+        # Speed band over which depth authority hands over from VBS (static) to
+        # stern plane + pitch (dynamic). See docs/waypoint-control-design-proposal.md §3.
+        self._node.declare_parameter('blend_u_lo', 0.2)
+        self._node.declare_parameter('blend_u_hi', 0.6)
+        # Blend depth loop: slow integral (Ti = Kp/Ki = 40 s) + pump-limited slew.
+        self._node.declare_parameter('blend_vbs_kp', 20.0)
+        self._node.declare_parameter('blend_vbs_ki', 0.5)
+        self._node.declare_parameter('blend_vbs_kd', 0.0)
+        self._node.declare_parameter('blend_vbs_slew', 5.0)
+
     def get_param(self):
 
         param = {}
@@ -96,5 +107,12 @@ class DivingModelParam():
         param['rpm_u_emergency'] = self._node.get_parameter('rpm_u_emergency').get_parameter_value().integer_value
 
         param['max_dive_pitch'] = self._node.get_parameter('max_dive_pitch').get_parameter_value().double_value
+
+        param['blend_u_lo'] = self._node.get_parameter('blend_u_lo').get_parameter_value().double_value
+        param['blend_u_hi'] = self._node.get_parameter('blend_u_hi').get_parameter_value().double_value
+        param['blend_vbs_kp'] = self._node.get_parameter('blend_vbs_kp').get_parameter_value().double_value
+        param['blend_vbs_ki'] = self._node.get_parameter('blend_vbs_ki').get_parameter_value().double_value
+        param['blend_vbs_kd'] = self._node.get_parameter('blend_vbs_kd').get_parameter_value().double_value
+        param['blend_vbs_slew'] = self._node.get_parameter('blend_vbs_slew').get_parameter_value().double_value
 
         return param
