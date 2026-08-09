@@ -54,6 +54,7 @@ from smarc_action_base.smarc_action_base import (
 )
 from smarc_msgs.action import BaseAction
 from smarc_msgs.msg import Topics as SmarcTopics
+from smarc_mission_msgs.msg import GotoWaypoint as GotoWaypointMsg
 from smarc_control_msgs.msg import Topics as ControlTopics
 
 from tf2_geometry_msgs import do_transform_pose_stamped
@@ -112,6 +113,13 @@ class DiveActionServerSub(SMARCActionServer, DiveSub):
         self._goal_frame = None
         self._goal_handle = None
 
+        # Current-WP telemetry (2026-08-09): every accepted goal is republished as a
+        # GotoWaypointMsg on mission/last_wp so visualizers (Unity WP hoops, GUI
+        # markers) can mirror the mission the vehicle is ACTUALLY running — the
+        # display subscribes to the vehicle's plan rather than being hand-authored.
+        self._last_wp_pub = self._node.create_publisher(
+            GotoWaypointMsg, "mission/last_wp", 10)
+
         self._loginfo("Dive Action Server started")
 
 
@@ -151,7 +159,19 @@ class DiveActionServerSub(SMARCActionServer, DiveSub):
         self._target_rpm = float(fmt_dict["waypoint"]["rpm"])
         self._target_depth = float(fmt_dict["waypoint"]["target_depth"])
         self._goal_tolerance = float(fmt_dict["waypoint"]["tolerance"])
-        
+
+        # Republish the accepted goal for visualizers (Unity WP hoop, GUI markers).
+        wp_msg = GotoWaypointMsg()
+        wp_msg.lat = geopoint.latitude
+        wp_msg.lon = geopoint.longitude
+        wp_msg.travel_depth = self._target_depth
+        wp_msg.travel_rpm = self._target_rpm
+        wp_msg.goal_tolerance = self._goal_tolerance
+        wp_msg.z_control_mode = GotoWaypointMsg.Z_CONTROL_DEPTH
+        wp_msg.speed_control_mode = GotoWaypointMsg.SPEED_CONTROL_RPM
+        wp_msg.name = fmt_dict.get("name", "wp")
+        self._last_wp_pub.publish(wp_msg)
+
         self._waypoint_point = convert_latlon_to_utm(geopoint)
 
         if self._target_depth < 0:
