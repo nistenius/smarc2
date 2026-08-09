@@ -61,6 +61,13 @@ class DivingModelParam():
         self._node.declare_parameter('blend_vbs_ki', 0.5)
         self._node.declare_parameter('blend_vbs_kd', 0.0)
         self._node.declare_parameter('blend_vbs_slew', 5.0)
+        # Velocity control + tightened setpoint following (2026-08-09 pm).
+        self._node.declare_parameter('blend_u_cruise', 0.5)        # m/s, read LIVE
+        self._node.declare_parameter('blend_a_brake', 0.05)        # m/s^2
+        self._node.declare_parameter('blend_rpm_kff', 1300.0)      # rpm per m/s (measured: 450 rpm -> 0.34 m/s)
+        self._node.declare_parameter('blend_int_holdoff', 0.3)     # m; 0 disables
+        self._node.declare_parameter('blend_course_comp', True)    # sideslip comp
+        self._node.declare_parameter('blend_dive_pitch_uref', 0.5) # m/s
 
     def get_param(self):
 
@@ -114,5 +121,11 @@ class DivingModelParam():
         param['blend_vbs_ki'] = self._node.get_parameter('blend_vbs_ki').get_parameter_value().double_value
         param['blend_vbs_kd'] = self._node.get_parameter('blend_vbs_kd').get_parameter_value().double_value
         param['blend_vbs_slew'] = self._node.get_parameter('blend_vbs_slew').get_parameter_value().double_value
+        param['blend_u_cruise'] = self._node.get_parameter('blend_u_cruise').get_parameter_value().double_value
+        param['blend_a_brake'] = self._node.get_parameter('blend_a_brake').get_parameter_value().double_value
+        param['blend_rpm_kff'] = self._node.get_parameter('blend_rpm_kff').get_parameter_value().double_value
+        param['blend_int_holdoff'] = self._node.get_parameter('blend_int_holdoff').get_parameter_value().double_value
+        param['blend_course_comp'] = self._node.get_parameter('blend_course_comp').get_parameter_value().bool_value
+        param['blend_dive_pitch_uref'] = self._node.get_parameter('blend_dive_pitch_uref').get_parameter_value().double_value
 
         return param

@@ -42,3 +42,9 @@
     blend_vbs_ki: 0.5
     blend_vbs_kd: 0.0
     blend_vbs_slew: 5.0
+    blend_u_cruise: 0.5
+    blend_a_brake: 0.05
+    blend_rpm_kff: 1300.0
+    blend_int_holdoff: 0.3
+    blend_course_comp: true
+    blend_dive_pitch_uref: 0.5
