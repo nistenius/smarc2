@@ -73,6 +73,11 @@ class DivingModelParam():
         # every existing launch unchanged; blend_sim.yaml turns it on in sim.
         self._node.declare_parameter('blend_obstacle_stop', False)
         self._node.declare_parameter('blend_obstacle_stop_topic', 'perception/obstacle/stop')
+        # Retry policy (Ivan, 2026-08-10 after run 064056): a stop may be a small
+        # moving object or noise — allow N stop->resume cycles per goal; one more
+        # trigger after that aborts the mission (smarc/abort -> BT emergency ->
+        # controller disengages -> VBS empties -> vehicle surfaces).
+        self._node.declare_parameter('blend_obstacle_retries', 3)
 
     def get_param(self):
 
@@ -134,5 +139,6 @@ class DivingModelParam():
         param['blend_dive_pitch_uref'] = self._node.get_parameter('blend_dive_pitch_uref').get_parameter_value().double_value
         param['blend_obstacle_stop'] = self._node.get_parameter('blend_obstacle_stop').get_parameter_value().bool_value
         param['blend_obstacle_stop_topic'] = self._node.get_parameter('blend_obstacle_stop_topic').get_parameter_value().string_value
+        param['blend_obstacle_retries'] = self._node.get_parameter('blend_obstacle_retries').get_parameter_value().integer_value
 
         return param

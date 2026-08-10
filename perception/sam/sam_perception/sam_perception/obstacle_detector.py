@@ -104,6 +104,12 @@ class ObstacleDetector(Node):
         self.declare_parameter("stop_a_stop", 0.1)      # m/s^2; conservative coast/brake decel
         self.declare_parameter("stop_hysteresis", 1.0)  # m; release at R_stop + this
         self.declare_parameter("stop_min_hold", 3.0)    # s
+        # Timed retry (Ivan, 2026-08-10): after this long stopped with the obstacle
+        # still there, release deliberately — the obstacle may have been a small
+        # moving object or noise, and re-approaching re-triggers cleanly on the
+        # latched envelope. The CONTROLLER counts re-triggers and aborts past its
+        # retry budget (blend_obstacle_retries), so trials end in abort + surface.
+        self.declare_parameter("stop_retry_wait", 10.0) # s
         self.declare_parameter("cloud_timeout", 2.0)    # s; stale-input policy above
 
         self.declare_parameter("publish_markers", True)
@@ -127,6 +133,7 @@ class ObstacleDetector(Node):
         self.stop_a_stop = float(gp("stop_a_stop"))
         self.stop_hyst = float(gp("stop_hysteresis"))
         self.stop_min_hold = float(gp("stop_min_hold"))
+        self.stop_retry_wait = float(gp("stop_retry_wait"))
         self.cloud_timeout = float(gp("cloud_timeout"))
         self.publish_markers = bool(gp("publish_markers"))
 
@@ -274,6 +281,16 @@ class ObstacleDetector(Node):
                     self.stop_active = False
                     self.r_stop_latched = None
                     self.get_logger().info(f"Protective stop released (clear to {r_cone:.1f} m)")
+                elif held >= self.stop_retry_wait > 0.0:
+                    # Timed retry: obstacle still there after the wait — release and
+                    # let the vehicle try again. Re-trigger lands on the latched
+                    # envelope; the controller's retry budget turns persistent
+                    # obstacles into an abort.
+                    self.stop_active = False
+                    self.r_stop_latched = None
+                    self.get_logger().warn(
+                        f"Protective stop RETRY release after {held:.0f} s "
+                        f"(obstacle still at {r_cone:.1f} m)")
 
         # ---- publish ----
         m = Float32MultiArray()

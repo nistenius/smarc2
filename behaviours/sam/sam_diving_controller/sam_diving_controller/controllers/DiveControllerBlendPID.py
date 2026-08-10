@@ -122,13 +122,33 @@ class DiveControllerBlendPID(DiveControllerInterface):
         self._obstacle_stop_flag = False
         self._obstacle_stop_stamp = None
         self._obstacle_stop_logged = False
+        # Retry-then-abort (Ivan, 2026-08-10, run 064056): each stop->resume cycle
+        # is a retry (the obstacle may be a small moving object or noise). One
+        # trigger beyond blend_obstacle_retries aborts via smarc/abort — the BT
+        # emergency path disengages the controller, VBS goes to empty (u_emergency
+        # = 0 = full buoyancy) and the vehicle surfaces. Counter resets per goal.
+        self._obstacle_stop_events = 0
+        self._obstacle_prev_hold = False
+        self._obstacle_aborted = False
+        self._abort_pub = None
         if self.param['blend_obstacle_stop']:
             from std_msgs.msg import Bool as _Bool
+            from std_msgs.msg import Empty as _Empty
+            from smarc_msgs.msg import Topics as _SmarcTopics
             self._node.create_subscription(
                 _Bool, self.param['blend_obstacle_stop_topic'],
                 self._obstacle_stop_cb, 1)
+            self._abort_pub = self._node.create_publisher(
+                _Empty, _SmarcTopics.ABORT_TOPIC, 1)
+            # Small status string for GUIs (Unity dashboard, later MC):
+            # "clear" | "STOP n/N" | "ABORT". Published on transitions and
+            # every tick while holding (no latched QoS: late subscribers).
+            from std_msgs.msg import String as _String
+            self._obstacle_status_pub = self._node.create_publisher(
+                _String, 'ctrl/obstacle_status', 1)
             self._loginfo("Protective stop ENABLED, listening on "
-                          f"{self.param['blend_obstacle_stop_topic']}")
+                          f"{self.param['blend_obstacle_stop_topic']}, "
+                          f"retries {self.param['blend_obstacle_retries']} then abort")
 
         self._loginfo("Blend Dive Controller created")
 
@@ -173,6 +193,10 @@ class DiveControllerBlendPID(DiveControllerInterface):
                              MissionStates.COMPLETED,
                              MissionStates.CANCELLED):
             self._loginfo_once(f"Mission {mission_state} — actuators neutral")
+            # New goal boundary: reset the obstacle retry budget.
+            self._obstacle_stop_events = 0
+            self._obstacle_prev_hold = False
+            self._obstacle_aborted = False
             self._set_actuators_neutral()
             return
 
@@ -218,19 +242,61 @@ class DiveControllerBlendPID(DiveControllerInterface):
         # The surge PI drives rpm through zero (active braking); VBS/LCG/rudder
         # loops keep running so depth is held during and after the stop.
         obstacle_hold = self._obstacle_hold()
+        if obstacle_hold and not self._obstacle_prev_hold:
+            # Rising edge = one stop event against the retry budget.
+            self._obstacle_stop_events += 1
+            retries = int(self.param['blend_obstacle_retries'])
+            if self._obstacle_stop_events > retries and not self._obstacle_aborted:
+                # Budget exhausted: this is not a transient. Abort the mission via
+                # the BT emergency path — controller disengages, VBS empties,
+                # vehicle surfaces. Operator recovers with $cancel_abort.
+                self._obstacle_aborted = True
+                self._node.get_logger().error(
+                    f"OBSTACLE ABORT: stop #{self._obstacle_stop_events} exceeds "
+                    f"retry budget ({retries}) — publishing smarc/abort, surfacing")
+                if self._abort_pub is not None:
+                    from std_msgs.msg import Empty as _Empty
+                    self._abort_pub.publish(_Empty())
+        self._obstacle_prev_hold = obstacle_hold
+        # GUI status string (see __init__).
+        if self.param['blend_obstacle_stop'] and self._abort_pub is not None:
+            from std_msgs.msg import String as _String
+            retries = int(self.param['blend_obstacle_retries'])
+            if self._obstacle_aborted:
+                status = "ABORT"
+            elif obstacle_hold:
+                status = f"STOP {self._obstacle_stop_events}/{retries}"
+            else:
+                status = "clear"
+            if obstacle_hold or self._obstacle_aborted or self._obstacle_stop_logged \
+               or status != getattr(self, '_obstacle_status_last', None):
+                self._obstacle_status_pub.publish(_String(data=status))
+                self._obstacle_status_last = status
         if obstacle_hold:
             surge_ref = 0.0
             if not self._obstacle_stop_logged:
                 self._node.get_logger().warn(
-                    "OBSTACLE PROTECTIVE STOP — surge ref forced to 0, holding depth "
-                    f"(distance to wp {current_distance:.1f} m)")
+                    "OBSTACLE PROTECTIVE STOP "
+                    f"({self._obstacle_stop_events}/{int(self.param['blend_obstacle_retries'])} of retry budget) "
+                    f"— surge ref forced to 0, holding depth (distance to wp {current_distance:.1f} m)")
                 self._obstacle_stop_logged = True
         elif self._obstacle_stop_logged:
-            self._node.get_logger().info("Obstacle stop cleared — resuming mission")
+            self._node.get_logger().info(
+                f"Obstacle stop cleared — resuming mission "
+                f"(retries used {self._obstacle_stop_events}/{int(self.param['blend_obstacle_retries'])})")
             self._obstacle_stop_logged = False
 
         # --- allocation: blend, don't switch --------------------------------------
         w = self._blend_weight(current_surge)
+
+        # Obstacle hold = static diving NOW (Ivan, 2026-08-10): don't wait for the
+        # speed to decay through the blend — force w = 0, which puts depth under
+        # static control: VBS depth PI + LCG pitch-trim PI (both always-running),
+        # pitch ref = trim setpoint, stern plane at zero authority. The vehicle
+        # station-keeps level at depth in front of the obstacle instead of
+        # planing/floating while w unwinds.
+        if obstacle_hold:
+            w = 0.0
 
         # Label for logging/BT only — never a controller input.
         if w < 0.2:
