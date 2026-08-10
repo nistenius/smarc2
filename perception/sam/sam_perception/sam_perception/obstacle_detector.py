@@ -109,7 +109,13 @@ class ObstacleDetector(Node):
         # moving object or noise, and re-approaching re-triggers cleanly on the
         # latched envelope. The CONTROLLER counts re-triggers and aborts past its
         # retry budget (blend_obstacle_retries), so trials end in abort + surface.
-        self.declare_parameter("stop_retry_wait", 10.0) # s
+        # 0.0 = OFF (default since 2026-08-10, Ivan): a timed release drives the
+        # vehicle FORWARD into an obstacle that is still inside the envelope — the
+        # closest approach crept 4.1 -> 2.7 m across cycles in run 20260810_093534.
+        # The stop now clears only when the obstacle genuinely clears (latched
+        # envelope + hysteresis); persistence is handled by the controller's hold
+        # timeout, which aborts instead of nudging closer.
+        self.declare_parameter("stop_retry_wait", 0.0)  # s; >0 re-enables timed release
         self.declare_parameter("cloud_timeout", 2.0)    # s; stale-input policy above
 
         self.declare_parameter("publish_markers", True)
@@ -173,12 +179,30 @@ class ObstacleDetector(Node):
             f"grid {self.n_az}x{self.n_el} over ±{np.degrees(self.az_half):.0f}°/±{np.degrees(self.el_half):.0f}°, "
             f"stop margin {self.stop_margin} m + envelope, cone ±{np.degrees(self.stop_cone):.0f}°")
 
+    def refresh_live_params(self):
+        """Envelope/retry params are read LIVE (2026-08-10) so they can be tuned with
+        `ros2 param set` between runs — the stopping-distance sweep changes them every
+        run and a node restart per point would be painful. Geometry/gating params stay
+        startup-only (they size preallocated work)."""
+        try:
+            self.stop_margin = float(self.get_parameter("stop_margin").value)
+            self.stop_t_react = float(self.get_parameter("stop_t_react").value)
+            self.stop_a_stop = float(self.get_parameter("stop_a_stop").value)
+            self.stop_hyst = float(self.get_parameter("stop_hysteresis").value)
+            self.stop_min_hold = float(self.get_parameter("stop_min_hold").value)
+            self.stop_retry_wait = float(self.get_parameter("stop_retry_wait").value)
+            self.stop_cone = np.radians(float(self.get_parameter("stop_cone_deg").value))
+            self.stop_enable = bool(self.get_parameter("stop_enable").value)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ inputs
     def odom_cb(self, msg: Odometry):
         self.speed = abs(msg.twist.twist.linear.x)
 
     def cloud_cb(self, msg: PointCloud2):
         self.last_cloud_time = self.get_clock().now()
+        self.refresh_live_params()
         pts = self.parse_cloud(msg)
         if pts is None:
             return

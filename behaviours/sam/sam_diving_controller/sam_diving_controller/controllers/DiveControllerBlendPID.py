@@ -129,14 +129,23 @@ class DiveControllerBlendPID(DiveControllerInterface):
         # = 0 = full buoyancy) and the vehicle surfaces. Counter resets per goal.
         self._obstacle_stop_events = 0
         self._obstacle_prev_hold = False
+        self._obstacle_hold_since = None
         self._obstacle_aborted = False
         self._abort_pub = None
-        if self.param['blend_obstacle_stop']:
+        # Live setpoints for GUIs (Unity banner, later MC): "depth,u,yaw_deg".
+        # Only the controller knows the ACTIVE references (surge_ref follows the
+        # braking profile, yaw_ref carries sideslip compensation) — the mission's
+        # per-leg values are not the same thing. Always on: display-only, 10 Hz,
+        # one short string.
+        from std_msgs.msg import String as _StringSp
+        self._setpoint_pub = self._node.create_publisher(
+            _StringSp, 'ctrl/setpoints', 1)
+        if self.param.get('blend_obstacle_stop', False):
             from std_msgs.msg import Bool as _Bool
             from std_msgs.msg import Empty as _Empty
             from smarc_msgs.msg import Topics as _SmarcTopics
             self._node.create_subscription(
-                _Bool, self.param['blend_obstacle_stop_topic'],
+                _Bool, self.param.get('blend_obstacle_stop_topic', 'perception/obstacle/stop'),
                 self._obstacle_stop_cb, 1)
             self._abort_pub = self._node.create_publisher(
                 _Empty, _SmarcTopics.ABORT_TOPIC, 1)
@@ -147,8 +156,8 @@ class DiveControllerBlendPID(DiveControllerInterface):
             self._obstacle_status_pub = self._node.create_publisher(
                 _String, 'ctrl/obstacle_status', 1)
             self._loginfo("Protective stop ENABLED, listening on "
-                          f"{self.param['blend_obstacle_stop_topic']}, "
-                          f"retries {self.param['blend_obstacle_retries']} then abort")
+                          f"{self.param.get('blend_obstacle_stop_topic', 'perception/obstacle/stop')}, "
+                          f"retries {self.param.get('blend_obstacle_retries', 3)} then abort")
 
         self._loginfo("Blend Dive Controller created")
 
@@ -160,12 +169,26 @@ class DiveControllerBlendPID(DiveControllerInterface):
         """True while a FRESH stop flag is raised. A stale flag (detector dead >2 s)
         does not hold the vehicle — same fail-open policy as the detector's own
         watchdog; revisit for hardware (session doc)."""
-        if not self.param['blend_obstacle_stop'] or not self._obstacle_stop_flag:
+        if not self.param.get('blend_obstacle_stop', False) or not self._obstacle_stop_flag:
             return False
         if self._obstacle_stop_stamp is None:
             return False
         age = (self._node.get_clock().now() - self._obstacle_stop_stamp).nanoseconds * 1e-9
         return age < 2.0
+
+    def _live(self, name, default):
+        """Read a ROS parameter LIVE each tick.
+
+        `self.param` is a dict snapshotted at node startup, so `ros2 param set`
+        does NOT reach it — that silently turned the first ki_hover flight
+        (run 20260810_092145) into a repeat of the baseline. Tuning params must
+        be read through here, like blend_u_cruise already was.
+        """
+        try:
+            p = self._node.get_parameter(name).get_parameter_value()
+            return p.double_value if p.type == 3 else default
+        except Exception:
+            return self.param.get(name, default)
 
     def _u_cruise_live(self):
         """blend_u_cruise is read live so runs can be set up with `ros2 param set`
@@ -196,6 +219,7 @@ class DiveControllerBlendPID(DiveControllerInterface):
             # New goal boundary: reset the obstacle retry budget.
             self._obstacle_stop_events = 0
             self._obstacle_prev_hold = False
+            self._obstacle_hold_since = None
             self._obstacle_aborted = False
             self._set_actuators_neutral()
             return
@@ -242,10 +266,34 @@ class DiveControllerBlendPID(DiveControllerInterface):
         # The surge PI drives rpm through zero (active braking); VBS/LCG/rudder
         # loops keep running so depth is held during and after the stop.
         obstacle_hold = self._obstacle_hold()
+
+        # Hold-persistence timeout (Ivan, 2026-08-10): the vehicle must NOT nudge
+        # forward while the obstacle is still inside the envelope — resume happens
+        # only when the detector genuinely clears it (latched envelope + margin).
+        # If it never clears, waiting forever is not a plan either: abort and
+        # surface so the operator can act.
+        if obstacle_hold:
+            if self._obstacle_hold_since is None:
+                self._obstacle_hold_since = self._node.get_clock().now()
+            else:
+                held = (self._node.get_clock().now()
+                        - self._obstacle_hold_since).nanoseconds * 1e-9
+                t_max = self._live('blend_obstacle_hold_timeout', 30.0)
+                if t_max > 0.0 and held > t_max and not self._obstacle_aborted:
+                    self._obstacle_aborted = True
+                    self._node.get_logger().error(
+                        f"OBSTACLE ABORT: obstacle has not cleared in {held:.0f} s "
+                        f"(limit {t_max:.0f} s) — publishing smarc/abort, surfacing")
+                    if self._abort_pub is not None:
+                        from std_msgs.msg import Empty as _Empty
+                        self._abort_pub.publish(_Empty())
+        else:
+            self._obstacle_hold_since = None
+
         if obstacle_hold and not self._obstacle_prev_hold:
             # Rising edge = one stop event against the retry budget.
             self._obstacle_stop_events += 1
-            retries = int(self.param['blend_obstacle_retries'])
+            retries = int(self.param.get('blend_obstacle_retries', 3))
             if self._obstacle_stop_events > retries and not self._obstacle_aborted:
                 # Budget exhausted: this is not a transient. Abort the mission via
                 # the BT emergency path — controller disengages, VBS empties,
@@ -259,13 +307,20 @@ class DiveControllerBlendPID(DiveControllerInterface):
                     self._abort_pub.publish(_Empty())
         self._obstacle_prev_hold = obstacle_hold
         # GUI status string (see __init__).
-        if self.param['blend_obstacle_stop'] and self._abort_pub is not None:
+        if self.param.get('blend_obstacle_stop', False) and self._abort_pub is not None:
             from std_msgs.msg import String as _String
-            retries = int(self.param['blend_obstacle_retries'])
+            retries = int(self.param.get('blend_obstacle_retries', 3))
             if self._obstacle_aborted:
-                status = "ABORT"
+                status = "ABORT surfacing"
             elif obstacle_hold:
-                status = f"STOP {self._obstacle_stop_events}/{retries}"
+                # Countdown to abort so the operator can see the clock run out.
+                t_max = self._live('blend_obstacle_hold_timeout', 30.0)
+                left = ""
+                if t_max > 0.0 and self._obstacle_hold_since is not None:
+                    held = (self._node.get_clock().now()
+                            - self._obstacle_hold_since).nanoseconds * 1e-9
+                    left = f" abort in {max(0.0, t_max - held):.0f}s"
+                status = f"STOP {self._obstacle_stop_events}/{retries}{left}"
             else:
                 status = "clear"
             if obstacle_hold or self._obstacle_aborted or self._obstacle_stop_logged \
@@ -277,13 +332,13 @@ class DiveControllerBlendPID(DiveControllerInterface):
             if not self._obstacle_stop_logged:
                 self._node.get_logger().warn(
                     "OBSTACLE PROTECTIVE STOP "
-                    f"({self._obstacle_stop_events}/{int(self.param['blend_obstacle_retries'])} of retry budget) "
+                    f"({self._obstacle_stop_events}/{int(self.param.get('blend_obstacle_retries', 3))} of retry budget) "
                     f"— surge ref forced to 0, holding depth (distance to wp {current_distance:.1f} m)")
                 self._obstacle_stop_logged = True
         elif self._obstacle_stop_logged:
             self._node.get_logger().info(
                 f"Obstacle stop cleared — resuming mission "
-                f"(retries used {self._obstacle_stop_events}/{int(self.param['blend_obstacle_retries'])})")
+                f"(retries used {self._obstacle_stop_events}/{int(self.param.get('blend_obstacle_retries', 3))})")
             self._obstacle_stop_logged = False
 
         # --- allocation: blend, don't switch --------------------------------------
@@ -336,6 +391,26 @@ class DiveControllerBlendPID(DiveControllerInterface):
             raw_rate = (current_depth - self._depth_prev) / self._dt
             self._depth_rate_lpf += (raw_rate - self._depth_rate_lpf) * min(1.0, self._dt / 1.0)
         self._depth_prev = current_depth
+
+        # Hover-trim schedule: interpolate the depth integral gain on the blend
+        # weight, so the trim integrates fast at hover (where VBS is the ONLY depth
+        # authority) and keeps the cruise tuning at speed (Ki 0.5 = Ti 40 s, chosen
+        # against the ~2 min heave mode; Ki 5 oscillated ±1 m at 122 s).
+        #
+        # BUMPLESS: the PI output contains Ki*(integral + anti_windup). Changing Ki
+        # alone would step the command by dKi*integral every tick that w moves. So
+        # rescale the stored integral to hold Ki*integral constant across the gain
+        # change — standard bumpless gain transfer.
+        ki_hover = self._live('blend_vbs_ki_hover', 0.0)
+        if ki_hover > 0.0:
+            ki_cruise = self.param['blend_vbs_ki']
+            ki_eff = ki_hover * (1.0 - w) + ki_cruise * w
+            ki_old = self._depth_vbs_pid._Ki
+            if ki_eff > 1e-9 and abs(ki_eff - ki_old) > 1e-9:
+                scale = ki_old / ki_eff
+                self._depth_vbs_pid._integral *= scale
+                self._depth_vbs_pid._anti_windup *= scale
+                self._depth_vbs_pid._Ki = ki_eff
 
         # Depth PI on VBS: always running. The integral is the buoyancy trim.
         i_prev = self._depth_vbs_pid._integral
@@ -397,9 +472,28 @@ class DiveControllerBlendPID(DiveControllerInterface):
         u_rpm = float(np.clip(self.param['blend_rpm_kff'] * surge_ref + pi_trim,
                               self.param['rpm_u_min'], self.param['rpm_u_max']))
 
+        # Active braking during an obstacle stop (stopping-distance test, Ivan
+        # 2026-08-10): reverse thrust while still moving instead of coasting to a
+        # halt on the surge PI. Disabled by default (blend_brake_rpm = 0) so the
+        # flown behaviour is unchanged until the test explicitly enables it.
+        brake_rpm = self._live('blend_brake_rpm', 0.0)
+        if obstacle_hold and brake_rpm < 0.0:
+            if abs(current_surge) > self._live('blend_brake_u_min', 0.05):
+                u_rpm = float(np.clip(brake_rpm, self.param['rpm_u_min'],
+                                      self.param['rpm_u_max']))
+            else:
+                u_rpm = 0.0
+                self._surge_rpm_pid.reset()   # no windup while parked on the brake
+
         # Sketchy minus sign kept from stock: positive steering angle compensates
         # a negative pitch.
         u_tv_stern = -u_tv_stern
+
+        # Publish the live setpoints for the GUI banner (depth m, surge m/s, yaw deg).
+        if self._setpoint_pub is not None:
+            from std_msgs.msg import String as _StringSp
+            self._setpoint_pub.publish(_StringSp(
+                data=f"{depth_setpoint:.2f},{surge_ref:.2f},{np.degrees(yaw_ref):.1f}"))
 
         self._dive_pub.set_vbs(u_vbs)
         self._dive_pub.set_lcg(u_lcg)
@@ -445,7 +539,7 @@ class DiveControllerBlendPID(DiveControllerInterface):
         s += f'depth: {current_depth:.3f}  setpoint: {depth_setpoint:.3f}  error: {depth_error:.3f}\n'
         s += f'pitch: {current_pitch:.3f}  pitch_ref: {pitch_ref:.3f}  dive_pitch: {dive_pitch_setpoint:.3f}\n'
         s += f'heading: {current_heading:.3f}  setpoint: {heading_setpoint:.3f}  yaw error: {yaw_error:.3f}\n'
-        s += f'vbs: {u_vbs:.3f} (raw {u_vbs_raw:.3f})  lcg: {u_lcg:.3f}\n'
+        s += f'vbs: {u_vbs:.3f} (raw {u_vbs_raw:.3f})  lcg: {u_lcg:.3f}  ki_vbs: {self._depth_vbs_pid._Ki:.2f}  int: {self._depth_vbs_pid._integral:.1f}\n'
         s += f'tv stern: {u_tv_stern:.3f}  tv rudder: {u_tv_rudder:.3f}  rpm: {u_rpm:.1f}\n'
         s += f'distance: {current_distance:.3f}\n'
         self._loginfo(s)

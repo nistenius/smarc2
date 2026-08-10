@@ -78,6 +78,23 @@ class DivingModelParam():
         # trigger after that aborts the mission (smarc/abort -> BT emergency ->
         # controller disengages -> VBS empties -> vehicle surfaces).
         self._node.declare_parameter('blend_obstacle_retries', 3)
+        # Hover-trim schedule (2026-08-10 control session): the VBS depth integral
+        # is tuned for cruise (Ki 0.5, Ti 40 s) where the stern plane shares the
+        # depth load. At u≈0 — where a protective stop leaves the vehicle — that is
+        # far too slow and the hull floats (measured: 1.2 -> 0.0 m over a 40 s hold
+        # sequence, run 20260810_084338). Ki is interpolated on the blend weight:
+        #     Ki_eff = ki_hover*(1-w) + ki_cruise*w
+        # 0.0 disables the schedule (= today's fixed-Ki behaviour, hardware safe).
+        # Max time to sit stopped in front of an obstacle that never clears.
+        # Beyond this the mission aborts (surface) rather than waiting forever or
+        # creeping closer (Ivan, 2026-08-10). 0 = wait indefinitely.
+        self._node.declare_parameter('blend_obstacle_hold_timeout', 30.0)
+        self._node.declare_parameter('blend_vbs_ki_hover', 0.0)
+        # Active braking during an obstacle stop (for the stopping-distance test):
+        # commanded rpm while still moving, instead of letting the surge PI coast
+        # to zero. 0.0 = disabled (current behaviour). Negative = reverse thrust.
+        self._node.declare_parameter('blend_brake_rpm', 0.0)
+        self._node.declare_parameter('blend_brake_u_min', 0.05)   # m/s, stop braking below this
 
     def get_param(self):
 
@@ -140,5 +157,9 @@ class DivingModelParam():
         param['blend_obstacle_stop'] = self._node.get_parameter('blend_obstacle_stop').get_parameter_value().bool_value
         param['blend_obstacle_stop_topic'] = self._node.get_parameter('blend_obstacle_stop_topic').get_parameter_value().string_value
         param['blend_obstacle_retries'] = self._node.get_parameter('blend_obstacle_retries').get_parameter_value().integer_value
+        param['blend_obstacle_hold_timeout'] = self._node.get_parameter('blend_obstacle_hold_timeout').get_parameter_value().double_value
+        param['blend_vbs_ki_hover'] = self._node.get_parameter('blend_vbs_ki_hover').get_parameter_value().double_value
+        param['blend_brake_rpm'] = self._node.get_parameter('blend_brake_rpm').get_parameter_value().double_value
+        param['blend_brake_u_min'] = self._node.get_parameter('blend_brake_u_min').get_parameter_value().double_value
 
         return param
