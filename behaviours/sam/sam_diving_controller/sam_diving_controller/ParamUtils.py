@@ -95,6 +95,20 @@ class DivingModelParam():
         # to zero. 0.0 = disabled (current behaviour). Negative = reverse thrust.
         self._node.declare_parameter('blend_brake_rpm', 0.0)
         self._node.declare_parameter('blend_brake_u_min', 0.05)   # m/s, stop braking below this
+        # Trim memory (Session C follow-up step 3, 2026-08-10): the correct VBS
+        # trim differs between hover and cruise (at speed the stern plane carries
+        # part of the depth load), and the Ti-40s integrator transiting between
+        # them through the 5 %/s pump slew is the float-up measured on the first
+        # obstacle hold (1.9 m -> SURFACED, run 20260810_010725). Scheduling
+        # (ki_hover) only makes the integral travel faster; seeding removes the
+        # journey: re-initialize the integral to the known trim on the
+        # obstacle_hold edges. Re-initialize, NOT reset — run 131224 measured
+        # that zeroing it kills diving. Default OFF = flown behaviour unchanged.
+        self._node.declare_parameter('blend_trim_memory', False)
+        # Measured settled hover VBS % (run_hover.sh prints it; 52-55 % on
+        # 20260810_090643). Read LIVE. 0.0 = unknown -> no hover seed until a
+        # settled hover trim has been learned in-flight.
+        self._node.declare_parameter('blend_vbs_hover_trim', 0.0)
 
     def get_param(self):
 
@@ -161,5 +175,7 @@ class DivingModelParam():
         param['blend_vbs_ki_hover'] = self._node.get_parameter('blend_vbs_ki_hover').get_parameter_value().double_value
         param['blend_brake_rpm'] = self._node.get_parameter('blend_brake_rpm').get_parameter_value().double_value
         param['blend_brake_u_min'] = self._node.get_parameter('blend_brake_u_min').get_parameter_value().double_value
+        param['blend_trim_memory'] = self._node.get_parameter('blend_trim_memory').get_parameter_value().bool_value
+        param['blend_vbs_hover_trim'] = self._node.get_parameter('blend_vbs_hover_trim').get_parameter_value().double_value
 
         return param

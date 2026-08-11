@@ -9,3 +9,12 @@
     # 2026-08-10 obstacle-avoidance session: obey the sam_perception obstacle
     # detector's protective-stop flag. Sim-only; hardware default stays False.
     blend_obstacle_stop: true
+    # 2026-08-10 Session C follow-up step 3: trim memory. Seed the VBS integral
+    # with the measured hover trim on the obstacle_hold edges instead of letting
+    # it transit at pump slew (the float-up). Sim-only until validated against
+    # run 094457 (acceptance: depth within ~0.2 m of leg depth for the whole
+    # hold); hardware defaults stay False / 0.0.
+    blend_trim_memory: true
+    # Settled hover VBS from run_hover.sh (20260810_090643: 52-55 %, mid-band).
+    # Re-run run_hover.sh to refine; live-settable (ros2 param set works).
+    blend_vbs_hover_trim: 53.5

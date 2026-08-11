@@ -132,6 +132,18 @@ class DiveControllerBlendPID(DiveControllerInterface):
         self._obstacle_hold_since = None
         self._obstacle_aborted = False
         self._abort_pub = None
+        # Trim memory (Session C follow-up step 3, 2026-08-10): hover trim !=
+        # cruise trim, and the integrator's Ti-40s transit between them through
+        # the 5 %/s pump slew is the float-up on obstacle stops. Store the
+        # settled VBS command per regime in %VBS — Ki-INVARIANT units, so the
+        # ki_hover schedule's bumpless rescale can't corrupt it — and re-seed
+        # the integral on the obstacle_hold edges. Seeding fixes the command
+        # TARGET; the pump slew below still shapes the actual command.
+        # Launch-gated (blend_trim_memory, default False): flown behaviour is
+        # bit-for-bit unchanged until enabled.
+        self._trim_hover = None    # learned settled VBS % at w < 0.2
+        self._trim_cruise = None   # learned settled VBS % at w > 0.8
+        self._trim_prev_hold = False  # own edge tracker (retry logic has its own)
         # Live setpoints for GUIs (Unity banner, later MC): "depth,u,yaw_deg".
         # Only the controller knows the ACTIVE references (surge_ref follows the
         # braking profile, yaw_ref carries sideslip compensation) — the mission's
@@ -175,6 +187,20 @@ class DiveControllerBlendPID(DiveControllerInterface):
             return False
         age = (self._node.get_clock().now() - self._obstacle_stop_stamp).nanoseconds * 1e-9
         return age < 2.0
+
+    def _seed_vbs_integral(self, trim_pct, label):
+        """Re-initialize (never reset — run 131224) the VBS depth integral so the
+        raw PI output equals `trim_pct` %VBS at zero error, under the CURRENT
+        (possibly ki_hover-scheduled) Ki. Anti-windup is cleared: it belongs to
+        the regime being left."""
+        ki = self._depth_vbs_pid._Ki
+        if ki <= 1e-9:
+            return
+        tgt = float(np.clip(trim_pct, self.param['vbs_u_min'], self.param['vbs_u_max']))
+        self._depth_vbs_pid._integral = (tgt - self.param['vbs_u_neutral']) / ki
+        self._depth_vbs_pid._anti_windup = 0.0
+        self._loginfo(f"TRIM SEED ({label}): VBS integral re-initialized to "
+                      f"{tgt:.1f} %VBS (Ki {ki:.2f}) — pump slew still applies")
 
     def _live(self, name, default):
         """Read a ROS parameter LIVE each tick.
@@ -221,6 +247,9 @@ class DiveControllerBlendPID(DiveControllerInterface):
             self._obstacle_prev_hold = False
             self._obstacle_hold_since = None
             self._obstacle_aborted = False
+            # Learned trims survive the goal boundary (trim is physics, not
+            # mission state); only the edge tracker resets.
+            self._trim_prev_hold = False
             self._set_actuators_neutral()
             return
 
@@ -412,6 +441,29 @@ class DiveControllerBlendPID(DiveControllerInterface):
                 self._depth_vbs_pid._anti_windup *= scale
                 self._depth_vbs_pid._Ki = ki_eff
 
+        # Trim memory seeding (step 3). Placed AFTER the ki_hover schedule so the
+        # seed goes through the Ki that will actually integrate it this tick
+        # (on the rising edge w is forced to 0, so Ki = ki_hover).
+        #   rising edge  -> seed the hover trim: learned if available, else the
+        #                   measured run_hover.sh constant (blend_vbs_hover_trim,
+        #                   live). No journey to make — the target is already
+        #                   right; only the pump slew remains.
+        #   falling edge -> seed back to the learned cruise trim, so resuming
+        #                   the leg doesn't repeat the transit in reverse.
+        # Cruise trim is only ever LEARNED while settled at w > 0.8 — never
+        # captured on the edge itself, so back-to-back holds (integral still at
+        # hover trim) can't corrupt the cruise memory.
+        if self.param.get('blend_trim_memory', False):
+            if obstacle_hold and not self._trim_prev_hold:
+                seed = self._trim_hover if self._trim_hover is not None \
+                    else self._live('blend_vbs_hover_trim', 0.0)
+                if seed > 0.0:
+                    self._seed_vbs_integral(seed, 'hover, on stop')
+            elif self._trim_prev_hold and not obstacle_hold:
+                if self._trim_cruise is not None:
+                    self._seed_vbs_integral(self._trim_cruise, 'cruise, on resume')
+            self._trim_prev_hold = obstacle_hold
+
         # Depth PI on VBS: always running. The integral is the buoyancy trim.
         i_prev = self._depth_vbs_pid._integral
         aw_prev = self._depth_vbs_pid._anti_windup
@@ -431,6 +483,22 @@ class DiveControllerBlendPID(DiveControllerInterface):
                 # moving toward the setpoint -> hold the integrator at its value
                 self._depth_vbs_pid._integral = i_prev
                 self._depth_vbs_pid._anti_windup = aw_prev
+
+        # Trim memory learning: while ON depth and NOT moving, the I-term IS the
+        # regime's trim — low-pass it (tau ~10 s) into the regime slot. This is
+        # why the second hold on 20260810_010725 recovered faster: the integral
+        # remembered. Now it remembers explicitly, per regime, across holds.
+        if self.param.get('blend_trim_memory', False):
+            if np.abs(depth_error) < 0.25 and np.abs(self._depth_rate_lpf) < 0.02:
+                trim_now = self.param['vbs_u_neutral'] + self._depth_vbs_pid._Ki * (
+                    self._depth_vbs_pid._integral + self._depth_vbs_pid._anti_windup)
+                a = min(1.0, self._dt / 10.0)
+                if w < 0.2:
+                    self._trim_hover = trim_now if self._trim_hover is None \
+                        else self._trim_hover + (trim_now - self._trim_hover) * a
+                elif w > 0.8:
+                    self._trim_cruise = trim_now if self._trim_cruise is None \
+                        else self._trim_cruise + (trim_now - self._trim_cruise) * a
 
         # Pump-limited slew (proposal §5: ~5 %/s stops bang-bang and overshoot).
         if self._u_vbs_prev is not None:
@@ -540,6 +608,12 @@ class DiveControllerBlendPID(DiveControllerInterface):
         s += f'pitch: {current_pitch:.3f}  pitch_ref: {pitch_ref:.3f}  dive_pitch: {dive_pitch_setpoint:.3f}\n'
         s += f'heading: {current_heading:.3f}  setpoint: {heading_setpoint:.3f}  yaw error: {yaw_error:.3f}\n'
         s += f'vbs: {u_vbs:.3f} (raw {u_vbs_raw:.3f})  lcg: {u_lcg:.3f}  ki_vbs: {self._depth_vbs_pid._Ki:.2f}  int: {self._depth_vbs_pid._integral:.1f}\n'
+        if self.param.get('blend_trim_memory', False):
+            # Check THIS line before trusting a trim run (the ki_hover trap).
+            th = 'none' if self._trim_hover is None else f'{self._trim_hover:.1f}'
+            tc = 'none' if self._trim_cruise is None else f'{self._trim_cruise:.1f}'
+            s += (f'trim mem: hover {th} %VBS  cruise {tc} %VBS  '
+                  f'seed param: {self._live("blend_vbs_hover_trim", 0.0):.1f}\n')
         s += f'tv stern: {u_tv_stern:.3f}  tv rudder: {u_tv_rudder:.3f}  rpm: {u_rpm:.1f}\n'
         s += f'distance: {current_distance:.3f}\n'
         self._loginfo(s)
