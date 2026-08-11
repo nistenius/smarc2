@@ -3,7 +3,21 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/tmux_layout.sh"
 
-# Set LOCAL_ROBOT_NAME, LOCAL_MQTT_BROKER_IP, and LOCAL_MQTT_BROKER_PORT in your bashrc
+# LOCAL_* comes from the environment (bashrc), or -- on Data Cube machines -- from the
+# GENERATED machine env file (gen_deployment_artifacts.py --env, single source:
+# deployments.yaml + fleet.yaml). Environment wins; the real vehicle (orin) has no such
+# file and is untouched by this. 2026-08-11 config-architecture session.
+DC_MACHINE_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/data-cube/unity_bridge.env"
+if [[ -z "${LOCAL_ROBOT_NAME:-}" && -f "$DC_MACHINE_ENV" ]]; then
+    set -a; source "$DC_MACHINE_ENV"; set +a
+    echo "machine config: $DC_MACHINE_ENV (${DC_DEPLOYMENT:-?}/${DC_MACHINE_ID:-?})"
+fi
+if [[ -z "${LOCAL_ROBOT_NAME:-}" || -z "${LOCAL_MQTT_BROKER_IP:-}" || -z "${LOCAL_MQTT_BROKER_PORT:-}" ]]; then
+    echo "ERROR: LOCAL_ROBOT_NAME / LOCAL_MQTT_BROKER_IP / LOCAL_MQTT_BROKER_PORT not set."
+    echo "Set them in your bashrc, or generate the machine env file:"
+    echo "    gen_deployment_artifacts.py --deployment <id> --machine <id> --env"
+    exit 1
+fi
 ROBOT_NAME=$LOCAL_ROBOT_NAME
 MQTT_BROKER_IP=$LOCAL_MQTT_BROKER_IP
 MQTT_BROKER_PORT=$LOCAL_MQTT_BROKER_PORT
@@ -127,7 +141,15 @@ row(
 )"
 
 SMARC_PUB_CMD="ros2 launch sam_smarc_publisher default.launch robot_name:=$ROBOT_NAME"
-MQTT_BRIDGE_CMD="ros2 launch str_json_mqtt_bridge waraps_bridge.launch broker_addr:=$MQTT_BROKER_IP broker_port:=$MQTT_BROKER_PORT robot_name:=$ROBOT_NAME domain:=subsurface context:=isee realsim:=$REALSIM use_sim_time:=$USE_SIM_TIME"
+# Agent identity from the fleet registry when this machine has one (generated env file,
+# LOCAL_WARAPS_AGENT -- see data-cube gen_deployment_artifacts.py). Without it the launch
+# falls back to its historical $USER_<robot_name> default, so the real vehicle (orin, which
+# sets no LOCAL_WARAPS_AGENT) behaves exactly as before. 2026-08-11.
+AGENT_NAME_ARG=""
+if [[ -n "${LOCAL_WARAPS_AGENT:-}" ]]; then
+    AGENT_NAME_ARG=" agent_name:=$LOCAL_WARAPS_AGENT"
+fi
+MQTT_BRIDGE_CMD="ros2 launch str_json_mqtt_bridge waraps_bridge.launch broker_addr:=$MQTT_BROKER_IP broker_port:=$MQTT_BROKER_PORT robot_name:=$ROBOT_NAME domain:=subsurface context:=isee realsim:=$REALSIM use_sim_time:=$USE_SIM_TIME$AGENT_NAME_ARG"
 # HEALTH_CHECKER_CMD="ros2 launch sam_health_checker sam_rate_health_checker.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME"
 # UTILS_CMD="ros2 launch smarc_bringups utilities.launch robot_name:=$ROBOT_NAME"
 

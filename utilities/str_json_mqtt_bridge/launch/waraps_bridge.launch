@@ -7,6 +7,13 @@
   <arg name="context" default="waraps"/>
   <arg name="domain" default="subsurface"/>
   <arg name="realsim" default="simulation"/>
+  <!-- The WARA-PS agent identity. Default preserves the historical $USER_robot_name
+       convention so nothing changes unless a caller passes agent_name explicitly.
+       That convention embeds the LOGIN USER in the vehicle's identity (the
+       parallels_sam_auv_v1 problem), so deployments that know who they are should pass
+       agent_name from their fleet registry (Data Cube: fleet.yaml sim.waraps_agent via
+       sam_bringup.sh's LOCAL_WARAPS_AGENT). 2026-08-11. -->
+  <arg name="agent_name" default="$(env USER nouser)_$(var robot_name)"/>
 
   <arg name="mqtt_params_file" default="$(find-pkg-share str_json_mqtt_bridge)/config/waraps.yaml"/>
 
@@ -14,7 +21,7 @@
     <param from="$(var mqtt_params_file)"/>
     <param name="mqtt.connection.port" value="$(var broker_port)"/>
     <param name="mqtt.connection.host" value="$(var broker_addr)"/>
-    <param name="mqtt.namespace" value="$(var context)/unit/$(var domain)/$(var realsim)/$(env USER nouser)_$(var robot_name)"/>
+    <param name="mqtt.namespace" value="$(var context)/unit/$(var domain)/$(var realsim)/$(var agent_name)"/>
   </node>
 
 
