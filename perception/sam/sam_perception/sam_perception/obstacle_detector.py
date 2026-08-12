@@ -37,6 +37,14 @@ Stale-input policy: if no cloud arrives for cloud_timeout seconds the stop flag 
 released and a warning is logged. That is the sim-friendly choice; on hardware a
 silent obstacle sensor in confined water should arguably fail CLOSED — revisit
 before any real-vehicle deployment (flagged in the session doc).
+
+HEALTH (2026-08-12): every output of this node is ambiguous read alone — a clear
+leg, a dead input, a failing TF and a gate that discards 100 % of every cloud all
+publish `nearest_range = -1` and `stop = False`. `perception/obstacle/health`
+resolves the ambiguity (see publish_health), and the cockpit refuses to paint the
+obstacle field green without it. Do not remove it to "simplify the topic list":
+the four cases above cost a full day of flights on 2026-08-12 precisely because
+nothing distinguished them.
 """
 import numpy as np
 import rclpy
@@ -46,7 +54,7 @@ from rclpy.time import Time
 from rclpy.duration import Duration
 
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Bool, Float32, Float32MultiArray, MultiArrayDimension
+from std_msgs.msg import Bool, Float32, Float32MultiArray, MultiArrayDimension, String
 from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
@@ -151,12 +159,31 @@ class ObstacleDetector(Node):
             PointCloud2, f'{ns}/{gp("cloud_topic")}', self.cloud_cb, qos_profile_sensor_data)
         self.sub_odom = self.create_subscription(
             Odometry, f'{ns}/{gp("odom_topic")}', self.odom_cb, qos_profile_sensor_data)
+        # The sensor's LIVE horizon ("Mode|range|hz"). The stop envelope is
+        # computed in metres ahead; if the sonar's horizon is SHORTER than
+        # R_stop(u), the vehicle is committed to a stop whose trigger it cannot
+        # observe. R_stop(0.5 m/s) = 4.25 m against a 4 m inspection horizon, so
+        # this is reachable, not theoretical.
+        self.sonar_range = None
+        self.sonar_mode = "?"
+        self.create_subscription(String, f"{ns}/payload/sonar3d/mode",
+                                 self.mode_cb, 5)
 
         self.pub_sectors = self.create_publisher(Float32MultiArray, f"{ns}/perception/obstacle/sectors", 1)
         self.pub_nearest = self.create_publisher(PointStamped, f"{ns}/perception/obstacle/nearest", 1)
         self.pub_range = self.create_publisher(Float32, f"{ns}/perception/obstacle/nearest_range", 1)
         self.pub_stop = self.create_publisher(Bool, f"{ns}/perception/obstacle/stop", 1)
         self.pub_markers = self.create_publisher(MarkerArray, f"{ns}/perception/obstacle/markers", 1)
+        # Health line (2026-08-12, after the day of five silent failures).
+        # WHY THIS EXISTS: every output below this node is ambiguous on its own.
+        # `nearest_range = -1` means "nothing in the gated volume" — which is
+        # what a clear leg looks like AND what a detector whose input is dead,
+        # whose TF never resolves, or whose gate discards 100 % of every cloud
+        # looks like. The HUD painted all four green. This topic is the node
+        # saying which one it is; the cockpit refuses to paint green without it.
+        # A plain String: no message generation on either side (same pattern as
+        # ctrl/setpoints), and it must never be the thing that fails to build.
+        self.pub_health = self.create_publisher(String, f"{ns}/perception/obstacle/health", 1)
 
         self.speed = 0.0
         self.stop_active = False
@@ -170,9 +197,25 @@ class ObstacleDetector(Node):
         self.last_cloud_time = None
         self._tf_warned = False
         self._n_clouds = 0
+        # Health bookkeeping (see pub_health). Counts are per-stage so the
+        # ambiguity in nearest_range can be resolved from the outside:
+        #   n_raw   points in the message
+        #   n_hits  after the no-hit/intensity gate   <- sensor actually returned
+        #   n_gated after range/z/cone gating         <- what the sectors see
+        # hits > 0 with gated == 0 for several clouds running is the range-gate
+        # failure; hits == 0 is honest open water.
+        self._n_raw = self._n_hits = self._n_gated = self._n_inrange = 0
+        self._gate_counts = (0, 0, 0, 0)
+        self._blind_streak = 0
+        self._tf_ok = True
+        self._rate_hz = 0.0
+        self._rate_t0 = None
+        self._rate_n0 = 0
+        self._health_state = None
 
         # Watchdog: publish stop (and staleness warnings) even when clouds stop coming.
         self.create_timer(0.5, self.watchdog)
+        self.create_timer(0.5, self.publish_health)
 
         self.get_logger().info(
             f"Obstacle detector up: cloud={ns}/{gp('cloud_topic')} -> body {self.body_frame}, "
@@ -199,6 +242,14 @@ class ObstacleDetector(Node):
     # ------------------------------------------------------------------ inputs
     def odom_cb(self, msg: Odometry):
         self.speed = abs(msg.twist.twist.linear.x)
+
+    def mode_cb(self, msg):
+        try:
+            parts = msg.data.split("|")
+            self.sonar_mode, self.sonar_range = parts[0], float(parts[1])
+        except Exception:
+            self.get_logger().warn(f"unparsable sonar mode '{msg.data}'",
+                                   throttle_duration_sec=30.0)
 
     def cloud_cb(self, msg: PointCloud2):
         self.last_cloud_time = self.get_clock().now()
@@ -231,6 +282,8 @@ class ObstacleDetector(Node):
             return None
         # No-hit rays: intensity 0, point at the world origin. Drop them first.
         keep = inten >= self.intensity_min
+        self._n_raw = len(xyz)
+        self._n_hits = int(keep.sum())
         return xyz[keep]
 
     def to_body(self, xyz, cloud_frame):
@@ -245,8 +298,10 @@ class ObstacleDetector(Node):
             if not self._tf_warned:
                 self.get_logger().warn(f"TF {cloud_frame} -> {self.body_frame} not available yet: {e}")
                 self._tf_warned = True
+            self._tf_ok = False
             return None
         self._tf_warned = False
+        self._tf_ok = True
         q = t.transform.rotation
         R = quat_to_rot(q.x, q.y, q.z, q.w)
         p = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
@@ -258,10 +313,39 @@ class ObstacleDetector(Node):
         az = np.arctan2(y, x)
         el = np.arctan2(z, np.hypot(x, y))
 
-        keep = ((rng >= self.range_min) & (rng <= self.range_max)
-                & (np.abs(z) <= self.z_band)
-                & (np.abs(az) <= self.az_half) & (np.abs(el) <= self.el_half))
+        rng_all = rng          # ranges of every RETURN, before any gate (health)
+        # Per-gate survivor counts. "Nothing survived gating" is a question, not an
+        # answer — the four gates mean four different things and only one of them
+        # is a defect. Naming the gate turns a BLIND from a puzzle into a
+        # diagnosis, and it costs four boolean sums per cloud.
+        g_rng = (rng >= self.range_min) & (rng <= self.range_max)
+        g_z   = np.abs(z) <= self.z_band
+        g_az  = np.abs(az) <= self.az_half
+        g_el  = np.abs(el) <= self.el_half
+        self._gate_counts = (int(g_rng.sum()), int((g_rng & g_z).sum()),
+                             int((g_rng & g_z & g_az).sum()),
+                             int((g_rng & g_z & g_az & g_el).sum()))
+        keep = g_rng & g_z & g_az & g_el
         body, rng, az, el = body[keep], rng[keep], az[keep], el[keep]
+        self._n_gated = len(rng)
+        # "Returns came back and the gate ate all of them" — the 2026-08-12
+        # range-gate-before-TF signature. One cloud proves nothing; a streak does.
+        #
+        # BUT the test must be against returns that were IN RANGE. A vehicle
+        # facing open water gets hits from the far wall at 20 m; the range gate
+        # drops them, leaving hits > 0 and gated == 0 — identical arithmetic to
+        # the defect, opposite meaning. Measured on the first clean baseline
+        # (run 15:15:22, t+70 s, just after the wp1->wp2 turn): a 1 s BLIND while
+        # the sonar was working perfectly and simply looking down an open leg.
+        #
+        # That false positive is not cosmetic. BLIND withholds the rose's
+        # free-range claim, which drives u_max to 0 — i.e. it would command the
+        # governor to HOLD THE VEHICLE IN OPEN WATER, the exact failure this
+        # session's review caught in the rose and fixed there.
+        n_inrange = int(((rng_all >= self.range_min) & (rng_all <= self.range_max)).sum())
+        self._n_inrange = n_inrange
+        self._blind_streak = (self._blind_streak + 1
+                              if (n_inrange > 0 and self._n_gated == 0) else 0)
 
         sectors = np.full((self.n_az, self.n_el), np.inf)
         if len(rng) > 0:
@@ -355,6 +439,100 @@ class ObstacleDetector(Node):
                 self.stop_active = False
             self.pub_stop.publish(Bool(data=False))
             self.get_logger().warn(f"no sonar cloud for {age:.1f} s", throttle_duration_sec=5.0)
+
+    def _gate_killer(self):
+        """Which gate emptied the cloud, and what it means.
+
+        The four gates are not interchangeable:
+          range  — everything is beyond range_max: OPEN WATER, or the sonar has
+                   switched to a shorter horizon. Not a fault.
+          z-band — returns exist but all outside +-z_band: the fan is looking at
+                   the seabed or the surface, not at anything the hull can hit.
+          az/el  — returns exist inside the band but outside the sector grid:
+                   a mount/frame problem, because the grid is the sensor's own FOV.
+        Only the last is unambiguously wrong, and it is the one nobody would have
+        guessed."""
+        n_rng, n_z, n_az, n_el = self._gate_counts
+        if n_rng == 0:
+            return f"all {self._n_hits} returns out of range (open water or short horizon)"
+        if n_z == 0:
+            return f"{n_rng} in range, ALL outside z-band +-{self.z_band} m (floor/surface?)"
+        if n_az == 0:
+            return f"{n_z} in band, ALL outside azimuth +-{np.degrees(self.az_half):.0f}deg"
+        if n_el == 0:
+            return f"{n_az} in azimuth, ALL outside elevation +-{np.degrees(self.el_half):.0f}deg"
+        return f"gates passed {n_rng}/{n_z}/{n_az}/{n_el} but 0 kept — unexplained"
+
+    def publish_health(self):
+        """Publish what only this node knows: whether its answer means anything.
+
+        Format (String, '|' separated so a HUD can split it without a parser):
+            STATE|rate_hz|age_s|n_hits|n_gated|detail
+
+        STATE:
+            OK        clouds fresh and conclusive
+            NO_INPUT  not one cloud since start — the endpoint-restart deafness
+            STALE     had clouds, stopped (age > cloud_timeout)
+            NO_TF     clouds arrive, the body-frame lookup fails, nothing is
+                      processed at all
+            BLIND     returns present, gating discards every one of them for
+                      blind_streak_min clouds running
+        Anything that is not OK means the range/stop outputs are NOT evidence,
+        and a run gated on them does not count (runbook rule 3).
+        """
+        now = self.get_clock().now()
+        if self._rate_t0 is None:
+            self._rate_t0, self._rate_n0 = now, self._n_clouds
+        dt = (now - self._rate_t0).nanoseconds * 1e-9
+        if dt >= 2.0:
+            self._rate_hz = (self._n_clouds - self._rate_n0) / dt
+            self._rate_t0, self._rate_n0 = now, self._n_clouds
+
+        if self.last_cloud_time is None:
+            age = float("inf")
+        else:
+            age = (now - self.last_cloud_time).nanoseconds * 1e-9
+
+        if self.last_cloud_time is None:
+            state, detail = "NO_INPUT", "no cloud since start (endpoint restart?)"
+        elif age > self.cloud_timeout:
+            state, detail = "STALE", f"no cloud for {age:.0f} s"
+        elif not self._tf_ok:
+            state, detail = "NO_TF", f"TF -> {self.body_frame} failing"
+        elif self._blind_streak >= 5:
+            state, detail = "BLIND", (f"{self._blind_streak} clouds, {self._gate_killer()} "
+                                      f"[{self._n_inrange} in range]")
+        else:
+            state, detail = "OK", f"{self._n_gated}/{self._n_inrange}/{self._n_hits} of {self._n_raw} pts"
+
+        # Can we see far enough to stop? Independent of everything above: the
+        # detector can be perfectly healthy AND unable to observe its own trigger.
+        if self.sonar_range is not None and state == "OK":
+            u = self.speed
+            r_stop = self.stop_margin + u * self.stop_t_react + u * u / (2.0 * self.stop_a_stop)
+            if r_stop > self.sonar_range:
+                state = "SHORT_HORIZON"
+                detail = (f"R_stop {r_stop:.1f} m at u={u:.2f} EXCEEDS the {self.sonar_mode} "
+                          f"horizon {self.sonar_range:.1f} m — slow down or go to navigation mode")
+
+        self.pub_health.publish(String(data=(
+            f"{state}|{self._rate_hz:.1f}|{age if np.isfinite(age) else -1.0:.1f}|"
+            f"{self._n_hits}|{self._n_gated}|{detail}")))
+        if state != self._health_state:
+            # DO NOT collapse these into `log = ... if ... else ...; log(msg)`.
+            # rclpy caches logging state per CALL SITE, so one line that logs at
+            # two different severities raises
+            #     ValueError: Logger severity cannot be changed between calls
+            # and kills the node. That is exactly what happened the first time
+            # this health line ran on the rig (2026-08-12): the detector died at
+            # its first OK -> not-OK transition, and the node meant to make
+            # perception failures visible became one. Separate call sites, always.
+            msg = f"detector health: {self._health_state} -> {state} ({detail})"
+            if state == "OK":
+                self.get_logger().info(msg)
+            else:
+                self.get_logger().error(msg)
+            self._health_state = state
 
     def publish_sector_markers(self, sectors, msg):
         ma = MarkerArray()

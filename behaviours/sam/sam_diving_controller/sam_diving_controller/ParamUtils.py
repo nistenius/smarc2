@@ -109,6 +109,31 @@ class DivingModelParam():
         # 20260810_090643). Read LIVE. 0.0 = unknown -> no hover seed until a
         # settled hover trim has been learned in-flight.
         self._node.declare_parameter('blend_vbs_hover_trim', 0.0)
+        # ---- HT3 speed governor (2026-08-12, strategy §28.2) -------------------
+        # The protective stop INVERTED: instead of a binary halt at R_stop, cap
+        # the surge reference at the largest speed whose stopping envelope still
+        # fits inside the measured margin. Same calibrated constants (t_react
+        # 1.0 s, a_stop 0.1 m/s^2), so this is not new safety theory — it is the
+        # continuous version of the law already flying, and Layer 1+2a stay armed
+        # underneath it (defence in depth: the governor should make stop triggers
+        # RARE, not impossible). Default OFF: hardware and every existing launch
+        # bit-for-bit unchanged.
+        self._node.declare_parameter('blend_speed_governor', False)
+        self._node.declare_parameter('blend_governor_topic', 'perception/speed_cap')
+        # Cap freshness. The asymmetry below is deliberate and is the safety
+        # argument for this feature:
+        #   never received a cap  -> do NOT cap (the belief node simply is not
+        #                            running; behave exactly as before HT3)
+        #   received, then silent -> creep at u_stale (something DIED mid-mission
+        #                            while we were trusting it)
+        self._node.declare_parameter('blend_governor_stale_sec', 2.0)
+        self._node.declare_parameter('blend_governor_u_stale', 0.2)   # m/s
+        # The governor must never command a true zero. A cap of 0 would hold the
+        # vehicle indefinitely with NO retry budget and NO abort timer — those
+        # are wired to the protective stop, not to this path — i.e. a silent
+        # deadlock in front of an obstacle. Commanding a hold stays the exclusive
+        # job of the stop layer, which knows how to escalate to abort+surface.
+        self._node.declare_parameter('blend_governor_u_floor', 0.05)  # m/s
 
     def get_param(self):
 
@@ -177,5 +202,10 @@ class DivingModelParam():
         param['blend_brake_u_min'] = self._node.get_parameter('blend_brake_u_min').get_parameter_value().double_value
         param['blend_trim_memory'] = self._node.get_parameter('blend_trim_memory').get_parameter_value().bool_value
         param['blend_vbs_hover_trim'] = self._node.get_parameter('blend_vbs_hover_trim').get_parameter_value().double_value
+        param['blend_speed_governor'] = self._node.get_parameter('blend_speed_governor').get_parameter_value().bool_value
+        param['blend_governor_topic'] = self._node.get_parameter('blend_governor_topic').get_parameter_value().string_value
+        param['blend_governor_stale_sec'] = self._node.get_parameter('blend_governor_stale_sec').get_parameter_value().double_value
+        param['blend_governor_u_stale'] = self._node.get_parameter('blend_governor_u_stale').get_parameter_value().double_value
+        param['blend_governor_u_floor'] = self._node.get_parameter('blend_governor_u_floor').get_parameter_value().double_value
 
         return param

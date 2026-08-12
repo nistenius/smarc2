@@ -31,6 +31,21 @@ There is no threshold to chatter across: w moves with speed, which moves slowly.
 u -> 0 the vehicle degrades into a hovering VBS regulator instead of losing depth
 control. A discrete label is derived from w for logging only ("Hover"/"Blended"/
 "Flight") — a label, not a controller input.
+
+Surge reference, in full (each term is a separate authority, and they compose by
+min() rather than by mode switching):
+
+    surge_ref = min( u_cruise,                       # the mission's ask
+                     sqrt(2*a_brake*d),              # arrive on the waypoint
+                     governor cap )                  # HT3: stop inside what we see
+    surge_ref = 0                                    # protective stop, Layer 2a
+
+The governor (blend_speed_governor, default OFF — strategy §28.2) is the protective
+stop's own envelope inverted: R_stop(u) = margin0 + u*t_react + u^2/(2*a) solved for
+u. Same calibrated constants, continuous instead of binary, so a shrinking margin
+produces a smooth decel to creep rather than a stop/resume cycle. It never commands
+zero (see blend_governor_u_floor) — commanding a hold stays the exclusive job of the
+stop layer, which knows how to escalate to abort and surface.
 """
 from sam_diving_controller.controllers.PIDControl import PIDControl
 from sam_diving_controller.IDivePub import MissionStates, ActuatorStates
@@ -171,7 +186,61 @@ class DiveControllerBlendPID(DiveControllerInterface):
                           f"{self.param.get('blend_obstacle_stop_topic', 'perception/obstacle/stop')}, "
                           f"retries {self.param.get('blend_obstacle_retries', 3)} then abort")
 
+        # ---- HT3 speed governor (2026-08-12, strategy §28.2) -------------------
+        self._cap = None            # last received u_max [m/s]
+        self._cap_stamp = None
+        self._gov_state = "OFF"
+        self._gov_logged = False
+        # The subscription and the status publisher are created UNCONDITIONALLY,
+        # and only the ACTION is gated (on a live-read parameter). Reason: the
+        # ki_hover flight 20260810_092145 was silently a repeat of the baseline
+        # because `ros2 param set` cannot reach a construction-time snapshot, and
+        # a governor whose enable can only be changed by rebuilding the bringup
+        # is a governor nobody will A/B in one session. On hardware the cap topic
+        # does not exist, so the callback never fires and behaviour is unchanged.
+        from std_msgs.msg import Float32 as _Float32
+        from std_msgs.msg import String as _StringG
+        topic = self.param.get('blend_governor_topic', 'perception/speed_cap')
+        self._node.create_subscription(_Float32, topic, self._speed_cap_cb, 1)
+        self._gov_pub = self._node.create_publisher(_StringG, 'ctrl/governor', 1)
+        self._loginfo(
+            f"Speed governor {'ENABLED' if self.param.get('blend_speed_governor', False) else 'armed but OFF'} "
+            f"on {topic} (live-settable: ros2 param set .. blend_speed_governor true). "
+            f"Floor {self.param.get('blend_governor_u_floor', 0.05):.2f} m/s, "
+            f"stale > {self.param.get('blend_governor_stale_sec', 2.0):.1f} s -> creep "
+            f"{self.param.get('blend_governor_u_stale', 0.2):.2f} m/s. "
+            "Protective stop remains armed underneath either way.")
+
         self._loginfo("Blend Dive Controller created")
+
+    def _speed_cap_cb(self, msg):
+        self._cap = float(msg.data)
+        self._cap_stamp = self._node.get_clock().now()
+
+    def _governor_cap(self):
+        """Speed cap to apply this tick, plus the state string for the cockpit.
+
+        Returns (cap_or_None, state). None = do not cap.
+
+        The three not-OK states are all reachable in normal operation and must
+        stay distinguishable — 'the belief is not running' and 'the belief died
+        while I was trusting it' call for opposite responses, and conflating
+        them is how a fail-safe becomes either a nuisance or a hazard.
+        """
+        if not self._live_bool('blend_speed_governor', False):
+            return None, "OFF"
+        if self._cap is None or self._cap_stamp is None:
+            # Never heard a cap: the margin-rose node is not running at all.
+            # Behave exactly as before HT3 rather than inventing a limit.
+            return None, "NO_CAP"
+        age = (self._node.get_clock().now() - self._cap_stamp).nanoseconds * 1e-9
+        if age > self._live('blend_governor_stale_sec', 2.0):
+            # It WAS running and went quiet. Something we were trusting died
+            # mid-mission; creep until it comes back.
+            return self._live('blend_governor_u_stale', 0.2), "STALE"
+        # Floor it: see blend_governor_u_floor. A hold is the stop layer's call.
+        floor = self._live('blend_governor_u_floor', 0.05)
+        return max(float(self._cap), floor), "LIVE"
 
     def _obstacle_stop_cb(self, msg):
         self._obstacle_stop_flag = bool(msg.data)
@@ -213,6 +282,16 @@ class DiveControllerBlendPID(DiveControllerInterface):
         try:
             p = self._node.get_parameter(name).get_parameter_value()
             return p.double_value if p.type == 3 else default
+        except Exception:
+            return self.param.get(name, default)
+
+    def _live_bool(self, name, default):
+        """Bool twin of _live(). Same reason: a snapshot dict cannot be reached by
+        `ros2 param set`, and an A/B that silently runs the baseline twice is
+        worse than no A/B (run 20260810_092145)."""
+        try:
+            p = self._node.get_parameter(name).get_parameter_value()
+            return p.bool_value if p.type == 1 else default
         except Exception:
             return self.param.get(name, default)
 
@@ -290,6 +369,34 @@ class DiveControllerBlendPID(DiveControllerInterface):
         surge_ref = min(u_cruise,
                         float(np.sqrt(2.0 * a_brake * (current_distance + d_eps))))
         current_surge = self._current_state.twist.twist.linear.x
+
+        # HT3 speed governor (§28.2): one more min() on the reference. The margin
+        # belief says how fast we may go and still stop inside what we can see;
+        # the braking profile says how fast we may go and still arrive on the
+        # waypoint. Take the slower. On an open leg the cap sits at u_cap (0.5)
+        # and this line does nothing — that is the false-positive guard, and it
+        # is why SAFE_zigzag must fly identically with the governor on.
+        gov_cap, gov_state = self._governor_cap()
+        if gov_cap is not None and gov_cap < surge_ref:
+            surge_ref = float(gov_cap)
+            if gov_state != "STALE":
+                gov_state = "CAPPING"
+            if not self._gov_logged:
+                self._node.get_logger().info(
+                    f"GOVERNOR capping surge {surge_ref:.2f} m/s ({gov_state})")
+                self._gov_logged = True
+        elif gov_state in ("LIVE", "OFF", "NO_CAP"):
+            if self._gov_logged:
+                self._node.get_logger().info("Governor no longer binding — cruise restored")
+                self._gov_logged = False
+            if gov_state == "LIVE":
+                gov_state = "OK"
+        self._gov_state = gov_state
+        if self._gov_pub is not None:
+            from std_msgs.msg import String as _StringG
+            self._gov_pub.publish(_StringG(data=(
+                f"{self._cap if self._cap is not None else float('nan'):.2f}|"
+                f"{surge_ref:.2f}|{gov_state}")))
 
         # Protective stop: obstacle inside the detector's envelope -> surge ref 0.
         # The surge PI drives rpm through zero (active braking); VBS/LCG/rudder

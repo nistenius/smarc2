@@ -18,3 +18,10 @@
     # Settled hover VBS from run_hover.sh (20260810_090643: 52-55 %, mid-band).
     # Re-run run_hover.sh to refine; live-settable (ros2 param set works).
     blend_vbs_hover_trim: 53.5
+    # 2026-08-12 HT3 speed governor (strategy §28.2). Starts OFF even in sim: the
+    # A/B is the whole test, and a governor that is on by default cannot be shown
+    # to leave SAFE_zigzag unchanged. LIVE-settable, so one bringup covers both
+    # arms of the experiment:
+    #     ros2 param set /sam_auv_v1/diving_node blend_speed_governor true
+    # Requires margin_rose_node running with enable:=true (it is the cap source).
+    blend_speed_governor: false

@@ -66,8 +66,21 @@ class PerceptionMonitor(Node):
                 lines.append(f'{short}: {hz:.1f} Hz')
             self.counts[topic] = 0
         silent = sum(1 for l in lines if 'SILENT' in l)
-        log = self.get_logger().warning if silent else self.get_logger().info
-        log(' | '.join(lines))
+        # DO NOT collapse these into `log = ... if ... else ...; log(msg)`.
+        # rclpy caches logging state per CALL SITE, so a single line that logs at
+        # two severities raises
+        #     ValueError: Logger severity cannot be changed between calls
+        # and kills the node. This monitor therefore died the FIRST time a topic
+        # went silent and came back — i.e. on every Unity Stop/Play and every ROS
+        # reconnect — which is what a rig session is made of. Found 2026-08-12
+        # when rig_doctor dumped the perception pane; it had been dying silently
+        # since 2026-08-09, so "is sim data flowing?" had no answer for days.
+        # Separate call sites, always.
+        msg = ' | '.join(lines)
+        if silent:
+            self.get_logger().warning(msg)
+        else:
+            self.get_logger().info(msg)
 
 
 def main(args=None):
