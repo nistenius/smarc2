@@ -46,6 +46,7 @@ obstacle field green without it. Do not remove it to "simplify the topic list":
 the four cases above cost a full day of flights on 2026-08-12 precisely because
 nothing distinguished them.
 """
+import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -89,7 +90,14 @@ class ObstacleDetector(Node):
         # hardware (where the cloud is already sensor-frame).
         self.declare_parameter("body_frame", "base_link_gt")
         self.declare_parameter("cloud_topic", "payload/sonar3d/points")
-        self.declare_parameter("odom_topic", "dr/odom")  # speed source for the envelope
+        # smarc/odom, NOT dr/odom. Measured on the rig 2026-08-14:
+        #   /sam_auv_v1/dr/odom   Publisher count: 0   Subscription count: 5
+        # Five nodes, this one included, waiting on a topic nobody publishes. The
+        # estimator's output is smarc/odom -- that is the topic bringup_nodes.yaml probes
+        # for state_estimator's health, and it carries a sane twist.
+        self.declare_parameter("odom_topic", "smarc/odom")  # speed source for the envelope
+        # How long the speed may go unheard before it counts as UNKNOWN rather than zero.
+        self.declare_parameter("stop_u_timeout", 3.0)   # s
 
         # Gating
         self.declare_parameter("range_min", 0.8)     # m; self/near-field rejection
@@ -107,9 +115,26 @@ class ObstacleDetector(Node):
         # Stop envelope
         self.declare_parameter("stop_enable", True)
         self.declare_parameter("stop_cone_deg", 35.0)   # forward cone that can trigger a stop
-        self.declare_parameter("stop_margin", 2.5)      # m; measured dispersion 2026-08-09
+        # Ivan, 2026-08-14: 0.5 m. Beckholmen's Vastra dockan is 20 m wide, and the previous
+        # trio (2.5 / 1.0 / 0.1) put the trigger at
+        #     R_stop = 2.5 + 0.5*1.0 + 0.5^2/(2*0.1) = 4.25 m at 0.5 m/s
+        # -- measured live, and the reason every dock run ended in a protective stop.
+        #
+        # a_stop 0.1 m/s^2 is a COASTING assumption; the file's own note says to raise it
+        # once the crash-stop distance is measured. 0.35 assumes active braking and is
+        # still a guess, but a less pessimistic one. The trio now gives
+        #     0.0 m/s -> 0.50 m    0.3 -> 0.93 m    0.5 -> 1.36 m    1.0 -> 2.93 m
+        # i.e. tight at dock speed and still growing with speed, which is the entire
+        # purpose of having reaction and braking terms at all. A FLAT 0.5 m is what put SAM
+        # into the wall on 2026-08-13; this is not that.
+        #
+        # NOT MEASURED on this hull. See docs/hardware-affecting-changes.md item 7.
+        self.declare_parameter("stop_margin", 0.5)      # m; dock margin, Ivan 2026-08-14
         self.declare_parameter("stop_t_react", 1.0)     # s; detector 5 Hz + controller 10 Hz + slew
-        self.declare_parameter("stop_a_stop", 0.1)      # m/s^2; conservative coast/brake decel
+        self.declare_parameter("stop_a_stop", 0.35)     # m/s^2; assumes ACTIVE braking
+        # Physical ceiling on the surge speed the envelope will believe. SAM does not do
+        # 2 m/s; anything above this is an estimator fault, not a fast vehicle.
+        self.declare_parameter("stop_u_max", 2.0)       # m/s
         self.declare_parameter("stop_hysteresis", 1.0)  # m; release at R_stop + this
         self.declare_parameter("stop_min_hold", 3.0)    # s
         # Timed retry (Ivan, 2026-08-10): after this long stopped with the obstacle
@@ -145,6 +170,9 @@ class ObstacleDetector(Node):
         self.stop_margin = float(gp("stop_margin"))
         self.stop_t_react = float(gp("stop_t_react"))
         self.stop_a_stop = float(gp("stop_a_stop"))
+        self.stop_u_max = float(gp("stop_u_max"))
+        self.stop_u_timeout = float(gp("stop_u_timeout"))
+        self._speed_at = None
         self.stop_hyst = float(gp("stop_hysteresis"))
         self.stop_min_hold = float(gp("stop_min_hold"))
         self.stop_retry_wait = float(gp("stop_retry_wait"))
@@ -231,6 +259,7 @@ class ObstacleDetector(Node):
             self.stop_margin = float(self.get_parameter("stop_margin").value)
             self.stop_t_react = float(self.get_parameter("stop_t_react").value)
             self.stop_a_stop = float(self.get_parameter("stop_a_stop").value)
+            self.stop_u_max = float(self.get_parameter("stop_u_max").value)
             self.stop_hyst = float(self.get_parameter("stop_hysteresis").value)
             self.stop_min_hold = float(self.get_parameter("stop_min_hold").value)
             self.stop_retry_wait = float(self.get_parameter("stop_retry_wait").value)
@@ -241,7 +270,71 @@ class ObstacleDetector(Node):
 
     # ------------------------------------------------------------------ inputs
     def odom_cb(self, msg: Odometry):
-        self.speed = abs(msg.twist.twist.linear.x)
+        """Surge speed for the stop envelope -- VALIDATED, because R_stop is unbounded in it.
+
+        R_stop = margin + u*t_react + u^2/(2*a_stop). That is quadratic in u, so a bad
+        speed does not degrade the envelope, it detonates it. Measured on the rig
+        2026-08-14: the estimator published u = 2.1e5 m/s ("DR no data" on the HUD at the
+        same moment) and R_stop came out at 2.3e13 m. Everything in the world is inside
+        that radius, so the detector latched a protective stop it could never release, the
+        BT aborted, and the emergency flag blocked every subsequent mission.
+
+        This was invisible until 2026-08-14 only because the envelope had been running
+        FLAT (t_react = 0, a_stop = 1e6), where u contributes nothing. Switching to the
+        speed-dependent envelope did not introduce the bug; it revealed one that had been
+        sitting under the protective stop the whole time.
+
+        An implausible reading is clamped UP, not discarded: not knowing your speed is not
+        a reason to assume you are stopped. It is logged every time, because a stop layer
+        quietly running on a fallback is exactly the kind of thing that should be loud.
+        """
+        u = msg.twist.twist.linear.x
+        if not math.isfinite(u):
+            self._note_bad_speed("non-finite", u)
+            self.speed = self.stop_u_max
+            return
+        u = abs(float(u))
+        if u > self.stop_u_max:
+            self._note_bad_speed("implausible", u)
+            u = self.stop_u_max
+        self.speed = u
+        self._speed_at = self.get_clock().now()
+
+    def _envelope_speed(self, now):
+        """The speed the envelope may believe. UNKNOWN is not zero.
+
+        `self.speed` initialises to 0.0 and is only ever written by odom_cb. So when the
+        speed source is absent -- exactly the state found on the rig 2026-08-14, where
+        dr/odom had zero publishers and five subscribers -- u stays 0.0 forever and
+        R_stop silently collapses to the bare margin. The reaction and braking terms
+        vanish, and the protective stop degrades into the flat envelope that put SAM into
+        the dry-dock wall, with nothing anywhere saying so.
+
+        A safety layer whose input is missing must fail LOUD and CONSERVATIVE, not quiet
+        and permissive. No speed for stop_u_timeout means "I do not know how fast I am
+        going", and the honest answer to that is the worst case.
+        """
+        if self._speed_at is None:
+            age = None
+        else:
+            age = (now - self._speed_at).nanoseconds / 1e9
+        if age is None or age > self.stop_u_timeout:
+            self._note_bad_speed(
+                "absent" if age is None else f"stale by {age:.1f} s", self.speed)
+            return self.stop_u_max
+        return self.speed
+
+    def _note_bad_speed(self, why: str, u) -> None:
+        """Rate-limited, because a broken estimator publishes at 20 Hz."""
+        now = self.get_clock().now()
+        last = getattr(self, "_bad_speed_at", None)
+        if last is not None and (now - last).nanoseconds < 5e9:
+            return
+        self._bad_speed_at = now
+        self.get_logger().error(
+            f"odom surge speed is {why} ({u}) — clamping to stop_u_max "
+            f"{self.stop_u_max} m/s for the stop envelope. R_stop is QUADRATIC in u, so an "
+            f"unvalidated speed makes the protective stop meaningless. Check the estimator.")
 
     def mode_cb(self, msg):
         try:
@@ -371,9 +464,9 @@ class ObstacleDetector(Node):
         # ---- stop envelope (forward cone only) ----
         in_cone = np.abs(az) <= self.stop_cone
         r_cone = float(np.min(rng[in_cone])) if np.any(in_cone) else np.inf
-        u = self.speed
-        r_stop = self.stop_margin + u * self.stop_t_react + u * u / (2.0 * self.stop_a_stop)
         now = self.get_clock().now()
+        u = self._envelope_speed(now)
+        r_stop = self.stop_margin + u * self.stop_t_react + u * u / (2.0 * self.stop_a_stop)
         if self.stop_enable:
             if not self.stop_active and r_cone <= r_stop:
                 self.stop_active = True
@@ -471,7 +564,11 @@ class ObstacleDetector(Node):
 
         STATE:
             OK        clouds fresh and conclusive
-            NO_INPUT  not one cloud since start — the endpoint-restart deafness
+            NO_INPUT  not one cloud since start. `detail` names WHICH side by counting
+                      matched publishers: 0 = nothing is producing (Unity side);
+                      >0 = advertised but undelivered (QoS / discovery / stale
+                      registration). Do not guess between those two — they have
+                      different fixes and the count is free.
             STALE     had clouds, stopped (age > cloud_timeout)
             NO_TF     clouds arrive, the body-frame lookup fails, nothing is
                       processed at all
@@ -494,7 +591,30 @@ class ObstacleDetector(Node):
             age = (now - self.last_cloud_time).nanoseconds * 1e-9
 
         if self.last_cloud_time is None:
-            state, detail = "NO_INPUT", "no cloud since start (endpoint restart?)"
+            # MEASURE, do not speculate. This used to read "(endpoint restart?)" — a
+            # guess baked into a status string, which on 2026-08-14 was quoted back as
+            # if it were evidence that an endpoint restart had happened. The node can
+            # simply ask its own subscription how many publishers it is matched to,
+            # which separates the two causes that need completely different fixes:
+            #   0 matched  -> nothing is producing (Unity side: sensor disabled, object
+            #                 inactive, or the publisher never registered)
+            #   >0 matched -> something advertises and delivers nothing (subscriber side:
+            #                 QoS mismatch, discovery, or stale registration after an
+            #                 endpoint restart)
+            # Note the count is of MATCHED publishers, so it already excludes the
+            # registered-but-silent case that `ros2 topic info` cannot see.
+            try:
+                npub = self.sub_cloud.get_publisher_count()
+            except Exception:      # older rclpy — degrade to the honest non-answer
+                npub = -1
+            if npub == 0:
+                detail = "no cloud since start; 0 publishers matched — nothing is producing"
+            elif npub > 0:
+                detail = (f"no cloud since start; {npub} publisher(s) matched but nothing "
+                          f"delivered — subscriber-side (QoS / discovery / stale registration)")
+            else:
+                detail = "no cloud since start; publisher count unavailable"
+            state = "NO_INPUT"
         elif age > self.cloud_timeout:
             state, detail = "STALE", f"no cloud for {age:.0f} s"
         elif not self._tf_ok:
@@ -508,7 +628,11 @@ class ObstacleDetector(Node):
         # Can we see far enough to stop? Independent of everything above: the
         # detector can be perfectly healthy AND unable to observe its own trigger.
         if self.sonar_range is not None and state == "OK":
-            u = self.speed
+            # Same guarded speed the stop itself uses. Reading self.speed raw here while
+            # the stop read the guarded value would let the HUD and the trigger disagree
+            # about the envelope -- two numbers for one question, which is how this whole
+            # class of bug keeps starting.
+            u = self._envelope_speed(self.get_clock().now())
             r_stop = self.stop_margin + u * self.stop_t_react + u * u / (2.0 * self.stop_a_stop)
             if r_stop > self.sonar_range:
                 state = "SHORT_HORIZON"

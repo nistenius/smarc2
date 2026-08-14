@@ -115,9 +115,22 @@ col(
 
 BT_CMD="ros2 launch wasp_bt wasp_bt.launch robot_name:=$ROBOT_NAME agent_type:=$AGENT_TYPE pulse_rate:=$PULSE_RATE use_sim_time:=$USE_SIM_TIME"
 # Controller selection (Session C, 2026-08-09): SAM_DIVE_LAUNCH picks the dive
-# controller launch file. Default = stock PID, unchanged behaviour.
-#   SAM_DIVE_LAUNCH=blend_pid_wp_following ... sam_bringup.sh   -> blend controller A/B
-DIVE_LAUNCH="${SAM_DIVE_LAUNCH:-pid_wp_following}"
+# controller launch file.
+#
+# Default changed to the BLEND controller 2026-08-13, Ivan's call: "this has been the one
+# working best up till now." The stock PID switches hard at |depth_error| <= 0.5 m and
+# commands rpm_u_neutral above it -- so descending to a 2 m setpoint it never turns the
+# props at all, and around the threshold it flips between modes and stutters. Measured on
+# the rig that day: depth oscillating 1.25-1.67 m against a 2 m target, thruster1/2_rpm
+# both 0, the vehicle diving and surfacing without ever driving forward. The blend
+# controller blends on measured surge instead of switching (Session C, three matched runs:
+# depth mean 1.53 -> 2.05 m, RMS 0.49 -> 0.19 m, prop cycling gone, 12.9 -> 7.0 min).
+#
+# THIS FILE IS THE DEFAULT FOR THE REAL BRINGUP. Setting it anywhere else does nothing --
+# data-cube's vehicle_services only supplies context for nodes the supervisor itself
+# launches, which in observe mode is none. Changing it there first, as was tried, is inert.
+#   SAM_DIVE_LAUNCH=pid_wp_following ... sam_bringup.sh   -> back to stock, for A/B
+DIVE_LAUNCH="${SAM_DIVE_LAUNCH:-blend_pid_wp_following}"
 CONTROLLER_CMD="ros2 launch sam_diving_controller ${DIVE_LAUNCH}.launch robot_name:=$ROBOT_NAME use_sim_time:=$USE_SIM_TIME"
 # EMERGENCY_ACTION_CMD="ros2 launch sam_emergency_action sam_emergency_action.launch robot_name:=$ROBOT_NAME"
 # HEALTH_FAKER_CMD replaced by the real sam_health_checker (uncommented per request 2026-07-24):

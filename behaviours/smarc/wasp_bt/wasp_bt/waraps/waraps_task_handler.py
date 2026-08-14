@@ -773,7 +773,29 @@ class WaraPSTaskHandler:
                 
                 tasks_to_start.append(task_dict)
                 
-            # self.tasks_executing.append(task_dict)
+            # A start-tst REPLACES the mission. It does not add to it.
+            #
+            # This was `extend` onto whatever was already in tasks_executing, with no
+            # clear anywhere on this path -- so a start-tst was appended behind the
+            # previous mission's leftover legs and the vehicle flew those first. Measured
+            # 2026-08-13: an earlier mission left legs 2/3/4 queued; the next mission was
+            # appended behind them; the vehicle flew the OLD waypoints, which crossed land,
+            # and drove into the dry-dock wall. From the operator's seat this reads as
+            # "the navigation is wrong", which is the most expensive possible way to
+            # present a queue that was never emptied.
+            #
+            # Cleared HERE, after every validation above has passed, so a rejected or
+            # malformed start-tst cannot wipe a mission that is legitimately running --
+            # each early return above leaves the queue untouched.
+            if self.tasks_executing:
+                self._node.get_logger().warn(
+                    f"start-tst replaces {len(self.tasks_executing)} task(s) still queued "
+                    f"from a previous mission: "
+                    f"{[t.get('description') for t in self.tasks_executing]}")
+                for task in self.tasks_executing:
+                    task["status"] = WaraPSTaskStates.ABORTED.value
+                    self.past_tasks.append(task)
+                self.tasks_executing = []
             self.tasks_executing.extend(tasks_to_start)
             # start mission timer
             self.mission_start_time = self.current_time()
@@ -965,7 +987,16 @@ class WaraPSTaskHandler:
         This method is called when the big red button is pressed.
         It will abort all tasks and set the aborted flag to True.
         """
-        self._node.get_logger().info("Big Red Button pressed, aborting all tasks")
+        # Names its own topic. Both abort callbacks logged the identical
+        # "Big Red Button pressed" line, so a log that proved an abort had arrived could
+        # not say WHICH path delivered it -- and the two mean completely different things:
+        # waraps/abort is an operator or C2 abort over MQTT, smarc/abort is the vehicle's
+        # own stack (relayed from core/abort by sam_smarc_publisher). Cost most of a night
+        # on 2026-08-13/14: the flag was confirmed to latch 91 ms before every mission
+        # cancel, with no way to tell who set it.
+        self._node.get_logger().warn(
+            f"ABORT via WARA-PS topic {Topics.WARA_PS_ABORT_TOPIC} (String, from MQTT/C2): "
+            f"{data.data!r} -- raising emergency flag, aborting all tasks")
         self.emergency_flag = True
         # set all tasks executing to aborted
         for task in self.tasks_executing:
@@ -992,7 +1023,14 @@ class WaraPSTaskHandler:
         """
         same as above, but no feedback to be sent.
         """
-        self._node.get_logger().info("Big Red Button pressed, aborting all tasks")
+        # See _bigredbutton_cb. This is the VEHICLE-SIDE abort: smarc/abort, which
+        # sam_smarc_publisher relays from core/abort, and which wasp_bt also publishes to
+        # itself via SMARCVehicle.abort(). If this fires with nothing obvious upstream,
+        # suspect that self-publish loop before suspecting an operator.
+        self._node.get_logger().warn(
+            f"ABORT via vehicle topic {Topics.ABORT_TOPIC} (Empty) -- raising emergency "
+            f"flag, aborting all tasks. Sources: core/abort relayed by "
+            f"sam_smarc_publisher, or SMARCVehicle.abort() in this process.")
         self.emergency_flag = True
         # set all tasks executing to aborted
         for task in self.tasks_executing:
