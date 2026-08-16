@@ -134,8 +134,9 @@ class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
             availability_check = self.emergency_action._setup(num_iters=3)
             if not availability_check:
                 # if the action client is not available, we cannot run it
-                # we can just chill
-                emergency_children.append(A_Chilling(self))
+                # we can just chill -- but say EMERGENCY PARKED, not "idle" (#29). This branch is
+                # only reached when the no-emergency check has already FAILED.
+                emergency_children.append(A_Chilling(self, A_Chilling.ROLE_EMERGENCY_PARKED))
             else:
                 # if the action client is available, we can run it
                 emergency_children.append(
@@ -146,8 +147,8 @@ class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
                     )
                 )
         else:
-            # if there is no emergency action, we can just chill
-            emergency_children.append(A_Chilling(self))
+            # if there is no emergency action, we can just chill -- again, EMERGENCY PARKED (#29)
+            emergency_children.append(A_Chilling(self, A_Chilling.ROLE_EMERGENCY_PARKED))
 
         return Fallback("F_HandleEmergency", memory=False, children=emergency_children)
                     
@@ -325,8 +326,9 @@ class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
         # add the mission tree to task handler
         task_children.append(mission_tree)
 
-        # add the chill task
-        task_children.append(A_Chilling(self))
+        # add the chill task. THIS one is genuine idle -- the resting state of a healthy vehicle
+        # with no mission, and the tip the mission gate looks for before an upload (#29).
+        task_children.append(A_Chilling(self, A_Chilling.ROLE_IDLE))
 
         task_handler = Fallback("F_Task_Handler", memory=False, children=task_children)
                                 

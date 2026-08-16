@@ -84,15 +84,58 @@ class A_WaitForData(VehicleBehaviour):
 class A_Chilling(VehicleBehaviour):
     """
     An Action to just do nothing (while waiting for task input)
-    """
 
-    def __init__(self, bt: HasClock):
-        name = f"{self.__class__.__name__}"
+    TWO MEANINGS, TWO NAMES (2026-08-15, #29). This class is instantiated in two completely
+    different places in the tree:
+
+      * as the LAST child of F_Task_Handler -- the resting state. Nothing is wrong; there is no
+        mission. This is the "just chillin'" the mission gate wants to see before an upload.
+      * inside F_HandleEmergency -- reached only when C_NoEmergencyAbortSignalDetected FAILS,
+        i.e. the vehicle is EMERGENCY PARKED and there is no emergency action available to run.
+        Nothing is fine; the vehicle has stopped because something went wrong.
+
+    Both reported the identical tip, `A_Chilling (Status.RUNNING)`, and identical feedback. So
+    "the tree is in A_Chilling" distinguished a healthy idle vehicle from an emergency-parked one
+    -- and Mission Control and Vehicle Control both had to render it as *ambiguous* because the
+    vehicle would not say which it was (their tests still pin that ambiguity handling, and it
+    stays, because a station must keep reading vehicles running older software).
+
+    `role` fixes it at the source. The emergency instance now names itself, so the tip is
+    self-describing and no consumer has to infer state from tree topology it cannot see.
+    """
+    ROLE_IDLE = "idle"
+    ROLE_EMERGENCY_PARKED = "emergency_parked"
+
+    def __init__(self, bt: HasClock, role: str = ROLE_IDLE):
+        self.role = role
+        # The NAME is the thing consumers see -- bt_status.tip is built from it. Keeping the
+        # class name for the idle case means every existing reader keeps working unchanged, and
+        # only the case that was previously indistinguishable gets a new word.
+        name = "A_Chilling" if role == A_Chilling.ROLE_IDLE else "A_EmergencyParked"
         super().__init__(bt, name)
         self.task_handler: WaraPSTaskHandler = self._bt._task_handler
 
+    @property
+    def _parked(self) -> bool:
+        return self.role == A_Chilling.ROLE_EMERGENCY_PARKED
+
+    def _parked_message(self) -> str:
+        """What an emergency-parked vehicle says, including WHY if it knows."""
+        origin = getattr(self.task_handler, "last_abort_origin", None)
+        detail = getattr(self.task_handler, "last_abort_detail", None)
+        why = (f"{origin}: {detail}" if origin else
+               "cause not recorded")   # never guessed -- see spec invariant 4b
+        return ("EMERGENCY PARKED -- not idle. The vehicle stopped and is holding. "
+                f"Cause: {why}. It will not accept a mission until the emergency flag is "
+                "cleared by an operator.")
 
     def update(self) -> Status:
+        if self._parked:
+            # Short-circuit: an emergency-parked vehicle must never report a mission-status
+            # message that reads like ordinary idling. This branch is the whole point of `role`.
+            self.feedback_message = self._parked_message()
+            return Status.RUNNING
+
         self.feedback_message = f"Just chillin'... Got something for me to do?"
 
         mission_status = self.task_handler.mission_status
@@ -100,7 +143,7 @@ class A_Chilling(VehicleBehaviour):
         if mission_status == None:
             # no mission, just chill
             self.feedback_message = "No mission, just chillin'..."
-            return Status.RUNNING 
+            return Status.RUNNING
         
         if mission_status == WaraPSTaskStates.ERROR.value:
             # mission is in error state, just chill

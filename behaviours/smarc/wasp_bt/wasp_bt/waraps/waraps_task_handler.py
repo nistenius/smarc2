@@ -106,6 +106,11 @@ class WaraPSTaskHandler:
 
         self.aborted_flag = False
         self.emergency_flag = False
+        # Who aborted, and why, for whoever asks after the fact. None until something does --
+        # never a placeholder string, because an unrecorded cause must report as unrecorded and
+        # never be guessed (Data Cube spec invariant 4b).
+        self.last_abort_origin = None
+        self.last_abort_detail = None
         self.health_status = Topics.VEHICLE_HEALTH_ERROR
         
         self.health_last_time = None
@@ -982,6 +987,69 @@ class WaraPSTaskHandler:
             # self._node.get_logger().error("No tasks executing")
             return None
 
+    # Every abort names WHERE IT CAME FROM. Vocabulary, deliberately closed and short, because
+    # these are the only things that can abort this vehicle and each implies a different next
+    # move for the operator:
+    #
+    #   operator_c2      an abort arrived on waraps/abort -- a human or another C2, over MQTT
+    #   vehicle_stack    an abort arrived on smarc/abort -- this hull's own stack (obstacle
+    #                    detector, health checker, anything relaying core/abort)
+    #   bt_health        THIS process's behaviour tree failed its own health checks and parked
+    #                    itself. No message arrived from anywhere; the tree decided.
+    #
+    # 2026-08-15 (#29). Before this, A_Abort -- the tree's OWN health fallback -- called
+    # _bigredbutton_cb() in-process with the literal "Big Red Button pressed", so a
+    # vehicle-internal abort logged as "from MQTT/C2" and published a WARA-PS response saying it
+    # was replying to a big red button nobody had pressed. The operator's own record then said a
+    # human aborted a mission that the vehicle aborted on itself, which is the worst possible
+    # direction for that error to point: it sends the next session looking for an operator
+    # action instead of a health fault. Same family as SETTLED §1's "never put a guess in a
+    # status string" -- here the guess was baked into a protocol message.
+    ABORT_ORIGIN_OPERATOR_C2 = "operator_c2"
+    ABORT_ORIGIN_VEHICLE_STACK = "vehicle_stack"
+    ABORT_ORIGIN_BT_HEALTH = "bt_health"
+
+    def _apply_abort(self, origin: str, detail: str, respond: bool, respond_to: str = None):
+        """Do the aborting. One body, three callers, and the origin travels with it.
+
+        `respond_to` is separate from `respond` on purpose. Only the WARA-PS topic carries an
+        actual request that a tst/response is an answer to; the tree's own health abort publishes
+        an announcement with NO `response-to`, because there is nothing it is answering. It still
+        publishes -- no abort path is allowed to get quieter than it was, since an abort the
+        operator cannot see is worse than one they see mislabelled.
+        """
+        self._node.get_logger().warn(
+            f"ABORT [origin={origin}] {detail} -- raising emergency flag, aborting all tasks")
+        self.emergency_flag = True
+        self.last_abort_origin = origin
+        self.last_abort_detail = detail
+
+        # set all tasks executing to aborted
+        for task in self.tasks_executing:
+            task["status"] = WaraPSTaskStates.ABORTED.value
+            self.past_tasks.append(task)
+
+        # clear the executing tasks list
+        self.tasks_executing = []
+
+        if respond:
+            response_msg = {
+                "agent-uuid": self._wara_ps_dict["agent-uuid"],
+                "response": "all tasks aborted",
+                # New field, additive: an older C2 ignores it, and this one stops having to infer
+                # the origin from the text of `response-to`.
+                "abort-origin": origin,
+                "abort-detail": detail,
+            }
+            if respond_to is not None:
+                response_msg["response-to"] = respond_to
+            msg = String()
+            msg.data = json.dumps(response_msg)
+            self._wara_ps_tst_response_pub.publish(msg)
+            self._node.get_logger().info(
+                f"Published abort response to WARA-PS (origin={origin})")
+        return
+
     def _bigredbutton_cb(self, data: String):
         """
         This method is called when the big red button is pressed.
@@ -994,31 +1062,13 @@ class WaraPSTaskHandler:
         # own stack (relayed from core/abort by sam_smarc_publisher). Cost most of a night
         # on 2026-08-13/14: the flag was confirmed to latch 91 ms before every mission
         # cancel, with no way to tell who set it.
-        self._node.get_logger().warn(
-            f"ABORT via WARA-PS topic {Topics.WARA_PS_ABORT_TOPIC} (String, from MQTT/C2): "
-            f"{data.data!r} -- raising emergency flag, aborting all tasks")
-        self.emergency_flag = True
-        # set all tasks executing to aborted
-        for task in self.tasks_executing:
-            task["status"] = WaraPSTaskStates.ABORTED.value
-            self.past_tasks.append(task)
-        
-        # clear the executing tasks list
-        self.tasks_executing = []
-
-        # publish the response
-        # create a response message
-        response_msg = {
-            "agent-uuid": self._wara_ps_dict["agent-uuid"],
-            "response": "all tasks aborted",
-            "response-to": data.data
-        }
-        msg = String()
-        msg.data = json.dumps(response_msg)
-        self._wara_ps_tst_response_pub.publish(msg)
-        self._node.get_logger().info('Published Big Red Button response message')
+        self._apply_abort(
+            self.ABORT_ORIGIN_OPERATOR_C2,
+            f"via WARA-PS topic {Topics.WARA_PS_ABORT_TOPIC} (String, from MQTT/C2): "
+            f"{data.data!r}",
+            respond=True, respond_to=data.data)
         return
-    
+
     def _emptybigredbutton_cb(self, data: Empty):
         """
         same as above, but no feedback to be sent.
@@ -1027,28 +1077,31 @@ class WaraPSTaskHandler:
         # sam_smarc_publisher relays from core/abort, and which wasp_bt also publishes to
         # itself via SMARCVehicle.abort(). If this fires with nothing obvious upstream,
         # suspect that self-publish loop before suspecting an operator.
-        self._node.get_logger().warn(
-            f"ABORT via vehicle topic {Topics.ABORT_TOPIC} (Empty) -- raising emergency "
-            f"flag, aborting all tasks. Sources: core/abort relayed by "
-            f"sam_smarc_publisher, or SMARCVehicle.abort() in this process.")
-        self.emergency_flag = True
-        # set all tasks executing to aborted
-        for task in self.tasks_executing:
-            task["status"] = WaraPSTaskStates.ABORTED.value
-            self.past_tasks.append(task)
-
-        # clear the executing tasks list
-        self.tasks_executing = []
-
-        # publish the response
+        self._apply_abort(
+            self.ABORT_ORIGIN_VEHICLE_STACK,
+            f"via vehicle topic {Topics.ABORT_TOPIC} (Empty). Sources: core/abort relayed by "
+            f"sam_smarc_publisher, or SMARCVehicle.abort() in this process.",
+            respond=False)
         return True
-    
-    def abort(self):
+
+    def abort(self, origin: str = None, detail: str = None):
+        """Abort every executing task and raise the emergency flag.
+
+        `origin` is required in practice: it defaults to bt_health because the only in-process
+        caller is the tree's own health fallback (A_Abort), and a caller that does not say who it
+        is has, by construction, not arrived from a topic. It is a keyword rather than a
+        positional so an existing `abort()` call site keeps working and gets the honest answer
+        instead of the old "Big Red Button pressed" lie.
         """
-        This method is called to abort all tasks and set the aborted flag to True.
-        It is used to handle the big red button press.
-        """
-        self._bigredbutton_cb(String(data="Big Red Button pressed"))
+        origin = origin or self.ABORT_ORIGIN_BT_HEALTH
+        if detail is None:
+            detail = ("the behaviour tree's own health checks failed and it parked the vehicle "
+                      "(A_Abort). No abort arrived from an operator or from the vehicle stack.")
+        # respond=True, respond_to=None: this path used to publish a tst/response (it went through
+        # _bigredbutton_cb), and taking that away would make an internal abort quieter than it was
+        # -- the wrong direction entirely. It publishes the same announcement, carrying the origin,
+        # and simply stops claiming to be a reply to a message nobody sent.
+        self._apply_abort(origin, detail, respond=True, respond_to=None)
         return True
 
     def _reset_emergency_cb(self, request, response):
@@ -1060,8 +1113,18 @@ class WaraPSTaskHandler:
         self.mission_start_time = None
         self.mission_timeout = None
         response.success = True
-        response.message = "Emergency flag set to False."
-        self._node.get_logger().info("Emergency flag reset to False by service call.")
+        # Name the cause being cleared. Data Cube spec invariant 4b: one manual clear for every
+        # cause, and the cause is NAMED -- so the operator confirming it can see what they are
+        # dismissing, and five clears for the same fault leave five readable records.
+        cleared = self.last_abort_origin
+        response.message = ("Emergency flag set to False." if cleared is None
+                            else f"Emergency flag set to False (was: {cleared} -- "
+                                 f"{self.last_abort_detail}).")
+        self._node.get_logger().info(
+            f"Emergency flag reset to False by service call. Cleared cause: "
+            f"{cleared if cleared is not None else 'not recorded'}")
+        # The cause stays on the record after the clear -- it is history, not live state, and
+        # deleting it is how "why did this abort last time?" became unanswerable.
         return response
     
     def get_available_tasks(self):
