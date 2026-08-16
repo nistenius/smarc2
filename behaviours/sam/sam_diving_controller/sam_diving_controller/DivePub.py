@@ -11,6 +11,7 @@ from sam_msgs.msg import Topics as SamTopics
 from sam_msgs.msg import ThrusterAngles, ThrusterRPMs
 
 from sam_diving_controller.IDivePub import ActuatorStates
+from sam_diving_controller.neutral_handoff import neutral_handoff
 
 from .ParamUtils import DivingModelParam
 
@@ -140,6 +141,33 @@ class DivePub(IDivePub):
 
 
 
+    def _surface_depth_m(self):
+        """The vehicle's own depth, positive down, or None if it has not said.
+
+        Wrapped and defensive on purpose: this runs on the actuator publish path, and a controller
+        that throws here stops publishing entirely -- which is the one failure worse than the one
+        being fixed. An exception degrades to "not reported", which the hand-off treats as
+        unconfirmed rather than as arrival.
+        """
+        try:
+            d = self._dive_sub.get_depth()
+        except Exception:
+            return None
+        return float(d) if d is not None else None
+
+    def _vbs_feedback_pct(self):
+        """VBS as the VEHICLE reports it (SamTopics.VBS_FB_TOPIC), never as we commanded it.
+
+        Reading back our own command would make the check vacuous -- it would confirm that we said
+        zero, which was never in doubt. The whole question is whether the tank got there. Same
+        rule as spec invariant 11: a probe must read something its own node does not write.
+        """
+        try:
+            v = self._dive_sub.get_control_input()['vbs']
+        except Exception:
+            return None
+        return float(v) if v is not None else None
+
     def update(self) -> None:
         """
         Publish all actuator values
@@ -155,11 +183,35 @@ class DivePub(IDivePub):
             self.thrust_rpms_pub.publish(self.rpm_msg)
             self._thrust_vector_pub.publish(self._thrust_vector_msg)
 
-            self._loginfo(f"Publish NEUTRAL step: {self.neutral_pub_count}")
-
-            
             self.neutral_pub_count += 1
-            if self.neutral_pub_count > 20:
+
+            # LETTING GO IS A CLAIM THAT THE VEHICLE IS SAFE, AND ONLY THE VEHICLE CAN SUPPORT IT.
+            #
+            # This used to be `if self.neutral_pub_count > 20: DISENGAGED` -- twenty publishes,
+            # one or two seconds, and then silence. A VBS tank does not empty in two seconds, so
+            # the command to empty was withdrawn mid-purge and the tank stopped wherever it had
+            # got to. That is the ~45% Ivan has been seeing on the HUD after every mission: not a
+            # held setpoint, an interrupted one. See neutral_handoff.py's header for the full
+            # chain and why a tick count can never answer this question.
+            verdict = neutral_handoff(
+                ticks=self.neutral_pub_count,
+                depth_m=self._surface_depth_m(),
+                vbs_pct=self._vbs_feedback_pct(),
+                vbs_target_pct=self.param['vbs_u_neutral'],
+                min_ticks=self.param.get('neutral_min_ticks', 20),
+                max_ticks=self.param.get('neutral_max_ticks', 600),
+                surface_depth_m=self.param.get('neutral_surface_depth_m', 0.35),
+                vbs_tol_pct=self.param.get('neutral_vbs_tol_pct', 5.0),
+            )
+            self._loginfo(f"NEUTRAL hand-off: {verdict.reason}")
+            if verdict.release:
+                if not verdict.confirmed:
+                    # Loud, because an unconfirmed release means the vehicle is being left with
+                    # nobody commanding it while it may still be under. That is a thing to find in
+                    # a log, not a thing to infer later from a screenshot of the HUD.
+                    self._node.get_logger().warn(
+                        f"Releasing actuators WITHOUT confirming the vehicle surfaced: "
+                        f"{verdict.reason}")
                 self.neutral_pub_count = 0
                 self.set_actuator_states(ActuatorStates.DISENGAGED, "DP")
 

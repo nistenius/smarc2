@@ -156,19 +156,65 @@ class DiveActionServerSub(SMARCActionServer, DiveSub):
         geopoint.latitude = float(fmt_dict["waypoint"]["latitude"])
         geopoint.longitude = float(fmt_dict["waypoint"]["longitude"])
         geopoint.altitude = 0.0 #float(fmt_dict["waypoint"]["altitude"])
-        self._target_rpm = float(fmt_dict["waypoint"]["rpm"])
-        self._target_depth = float(fmt_dict["waypoint"]["target_depth"])
-        self._goal_tolerance = float(fmt_dict["waypoint"]["tolerance"])
+        wp = fmt_dict["waypoint"]
+        self._target_rpm = float(wp["rpm"])
+        self._target_depth = float(wp["target_depth"])
+        self._goal_tolerance = float(wp["tolerance"])
 
-        # Republish the accepted goal for visualizers (Unity WP hoop, GUI markers).
+        # ---- Optional per-waypoint fields (Data Cube 2026-08-15) -------------------------------
+        # `speed`, `depth_mode` and `target_altitude` are ABSENT on a waypoint that does not ask
+        # for them, and a waypoint from QGIS Mission Control never will. Every default below is
+        # therefore exactly what this server did before they existed, so an old mission and a new
+        # one that says nothing new are indistinguishable here.
+        #
+        # GotoWaypoint has carried Z_CONTROL_ALTITUDE/travel_altitude and
+        # SPEED_CONTROL_SPEED/travel_speed since long before this; nothing has ever SET them (the
+        # only reference in the whole tree was commented out in dubins.py). So this is not a new
+        # vocabulary, it is the first mission that uses the one already agreed.
+        self._target_speed = float(wp["speed"]) if wp.get("speed") is not None else None
+        self._depth_mode = str(wp.get("depth_mode") or "hold_depth")
+        self._target_altitude = (float(wp["target_altitude"])
+                                 if wp.get("target_altitude") is not None else None)
+
+        if self._depth_mode not in ("hold_depth", "hold_altitude", "bottom_track"):
+            # Refuse rather than fall back to hold_depth: an operator who asked to follow the
+            # contour and silently got a fixed depth is flown into the slope they were avoiding.
+            self.set_mission_state(MissionStates.REJECTED, "AS")
+            self._node.get_logger().error(
+                f"Unknown depth_mode {self._depth_mode!r}. Refusing the goal rather than "
+                f"silently flying it at a fixed depth.")
+            return GoalResponse.REJECT
+        if self._depth_mode != "hold_depth" and self._target_altitude is None:
+            self.set_mission_state(MissionStates.REJECTED, "AS")
+            self._node.get_logger().error(
+                f"depth_mode={self._depth_mode} needs target_altitude, and none was sent. "
+                f"Refusing: 'follow the bottom at an unspecified height' has no safe reading.")
+            return GoalResponse.REJECT
+
+        # Republish the accepted goal for visualizers (Unity WP hoop, GUI markers) AND for the
+        # bottom-follow setpoint node, which needs to know the commanded altitude.
         wp_msg = GotoWaypointMsg()
         wp_msg.lat = geopoint.latitude
         wp_msg.lon = geopoint.longitude
         wp_msg.travel_depth = self._target_depth
         wp_msg.travel_rpm = self._target_rpm
         wp_msg.goal_tolerance = self._goal_tolerance
-        wp_msg.z_control_mode = GotoWaypointMsg.Z_CONTROL_DEPTH
-        wp_msg.speed_control_mode = GotoWaypointMsg.SPEED_CONTROL_RPM
+        # travel_depth is populated in EVERY mode. Under bottom-following it is the ceiling to
+        # fall back to when the seabed is out of the altimeter's range -- a vehicle that cannot
+        # see the bottom must still have a depth to hold, or it has no z command at all.
+        if self._depth_mode == "hold_depth":
+            wp_msg.z_control_mode = GotoWaypointMsg.Z_CONTROL_DEPTH
+        else:
+            wp_msg.z_control_mode = GotoWaypointMsg.Z_CONTROL_ALTITUDE
+            wp_msg.travel_altitude = self._target_altitude
+        if self._target_speed is not None:
+            wp_msg.speed_control_mode = GotoWaypointMsg.SPEED_CONTROL_SPEED
+            wp_msg.travel_speed = self._target_speed
+            # rpm travels too, unchanged: it is what a speed controller falls back to, and
+            # dropping it would leave the vehicle with no thrust command if speed control is
+            # unavailable. Same rule as the wire format -- speed BESIDE rpm, never instead of it.
+        else:
+            wp_msg.speed_control_mode = GotoWaypointMsg.SPEED_CONTROL_RPM
         wp_msg.name = fmt_dict.get("name", "wp")
         self._last_wp_pub.publish(wp_msg)
 
