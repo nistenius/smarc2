@@ -1,0 +1,49 @@
+<launch>
+
+    <!-- Algae-farm inspection perception (2026-08-16, UNFLOWN).
+
+         Two nodes:
+           sss_farm_detector  side-scan intensities -> rope/buoy detections
+                              <ns>/payload/sidescan -> <ns>/perception/farm/detections
+           farm_localizer     detections + pose + prior -> a verified farm map
+                              -> <ns>/perception/farm/report
+
+         Neither writes to an actuator and neither holds an action client. All motion in
+         this mission goes through the existing BT -> auv_depth_move_to pipeline
+         (design decision D2, spec invariant 12): the inspection logic is a GOAL SOURCE,
+         the same shape as bottom-following in ADR-004.
+
+         POSE SOURCE. `pose_topic` defaults to the estimator's `dr/odom`. Unity publishes
+         `smarc/odom` and `core/odom_gt` from ground truth in sim (SETTLED §4), so a
+         localizer reading either produces a map that is right because it was told the
+         answer. Overriding it is a legitimate experiment; doing so silently is not, and
+         the topic name travels in every report.
+
+         FARM PRIOR. Generated, never hand-written:
+             python3 data-cube/scripts/kristineberg-site/make_farm_prior.py
+         The localizer refuses to start without it rather than substituting a built-in
+         farm — an invented prior sends the mission confidently to the wrong place. -->
+
+    <arg name="robot_name" default="sam_auv_v1"/>
+    <arg name="use_sim_time" default="false"/>
+    <arg name="pose_topic" default="dr/odom"/>
+    <arg name="farm_prior_path" default=""/>
+    <!-- HF680 preset range. Only used when the Sidescan message's own max_duration is 0,
+         which is what an un-rebuilt Unity produces; the detector says on every health
+         line which of the two it is using. -->
+    <arg name="max_range_m" default="100.0"/>
+
+    <node name="sss_farm_detector" pkg="sam_farm_inspection" exec="sss_farm_detector" output="screen">
+        <param name="robot_name" value="$(var robot_name)"/>
+        <param name="use_sim_time" value="$(var use_sim_time)"/>
+        <param name="max_range_m" value="$(var max_range_m)"/>
+    </node>
+
+    <node name="farm_localizer" pkg="sam_farm_inspection" exec="farm_localizer" output="screen">
+        <param name="robot_name" value="$(var robot_name)"/>
+        <param name="use_sim_time" value="$(var use_sim_time)"/>
+        <param name="pose_topic" value="$(var pose_topic)"/>
+        <param name="farm_prior_path" value="$(var farm_prior_path)"/>
+    </node>
+
+</launch>

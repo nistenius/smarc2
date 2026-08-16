@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sam_farm_inspection</name>
+  <version>0.0.1</version>
+  <description>
+    Autonomous algae-farm inspection for SAM: side-scan rope/buoy detection
+    (sensors-22-05064 section 5), farm localization against a prior (section 6), and the
+    lane geometry the inspection is flown on.
+
+    Two nodes, one package: `sss_farm_detector` and `farm_localizer` share the farm prior
+    loader, the side-scan geometry model and the protective-stop envelope, and splitting
+    them into two ament packages would have meant either duplicating those three modules
+    or inventing a third package to hold them.
+
+    The farm prior itself is NOT in this package. It is generated from the site's own
+    measurements by data-cube/scripts/kristineberg-site/make_farm_prior.py and read at
+    runtime, so a node never carries farm constants (spec section 7, single sources).
+  </description>
+  <maintainer email="stenius@kth.se">Ivan Stenius</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>smarc_msgs</depend>
+  <depend>tf2_ros_py</depend>
+  <depend>python3-numpy</depend>
+  <depend>python3-yaml</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
