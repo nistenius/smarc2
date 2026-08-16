@@ -437,8 +437,35 @@ class ObstacleDetector(Node):
         # session's review caught in the rose and fixed there.
         n_inrange = int(((rng_all >= self.range_min) & (rng_all <= self.range_max)).sum())
         self._n_inrange = n_inrange
+
+        # WHICH GATE emptied the cloud decides whether this is blindness at all.
+        # `_gate_killer()` already says so in prose — range is "not a fault", z-band
+        # means "the fan is looking at the seabed or the surface, not at anything the
+        # hull can hit", and only az/el is "unambiguously wrong" — but the streak used
+        # to count all three the same, so it contradicted the very string it printed.
+        #
+        # This is the SAME BUG, ONE GATE OVER, as the 2026-08-12 fix above. That one
+        # stopped the RANGE gate manufacturing BLINDs by testing n_inrange instead of
+        # n_hits. The Z gate has the identical shape: a surfaced vehicle over a seabed
+        # 4.7 m down with z_band 1.5 m gets n_inrange in the hundreds and n_gated == 0
+        # on every single cloud, forever. Measured at Kristineberg 2026-08-16:
+        # "6144 clouds, 684 in range, ALL outside z-band" — a permanent BLIND on a
+        # sonar that was working perfectly and looking at open water.
+        #
+        # And it is not cosmetic, for the reason already written above: BLIND withholds
+        # the rose's free-range claim, the forward cone goes UNKNOWN, u_max(NaN) = 0,
+        # and the governor holds the vehicle IN OPEN WATER. A state that means "my
+        # answer is not evidence" must not fire in the one condition where the answer
+        # is trivially true and safe, or an operator learns to ignore it.
+        #
+        # So: the cloud counts toward a blind streak only when returns got as far as
+        # the SECTOR GRID and were still lost — i.e. they were in range AND within the
+        # z-band, and az/el discarded them. The grid is the sensor's own FOV, so that
+        # is a mount/frame defect and nothing else.
+        n_rng, n_z, _n_az, _n_el = self._gate_counts
+        killed_by_sector_grid = (n_z > 0 and self._n_gated == 0)
         self._blind_streak = (self._blind_streak + 1
-                              if (n_inrange > 0 and self._n_gated == 0) else 0)
+                              if (n_inrange > 0 and killed_by_sector_grid) else 0)
 
         sectors = np.full((self.n_az, self.n_el), np.inf)
         if len(rng) > 0:
