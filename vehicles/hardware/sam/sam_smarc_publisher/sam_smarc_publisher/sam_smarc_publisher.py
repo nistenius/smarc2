@@ -93,8 +93,27 @@ class SAMSMARCPublisher(Node):
         self.battery_percent_pub.publish(msg)
 
     def _create_altitude_pubsub(self):
+        """
+        ALTITUDE means HEIGHT ABOVE THE SEABED, and its only source is the DVL altimeter.
+
+        It used to be fed from the DR odometry's z (height above sea level) in odom_callback,
+        which is a different physical quantity that merely shares the English word. The result,
+        measured on the rig 2026-08-18: a vehicle floating at the surface published
+        "altitude = -0.00" while the DVL was reading a stable 4.6 m of bottom clearance. The
+        health checker compares this topic against min_altitude (0.5 m), so it raised a low
+        altitude fault every few seconds, vehicle_health flapped READY <-> ERROR, and the
+        behaviour tree's own health check aborted and re-parked the vehicle each time the
+        operator cleared the emergency in Mission Control.
+
+        -1 is the smarc_msgs/DVL "invalid measurement" sentinel (dropout / no bottom lock) and is
+        forwarded unchanged: consumers must distinguish "no bottom in range" from "on the bottom".
+        """
         self.altitude_pub = self.create_publisher(Float32, SmarcTopics.ALTITUDE_TOPIC, 10)
-        
+        self.dvl_sub = self.create_subscription(DVL, SamTopics.DVL_TOPIC, self.dvl_callback, 10)
+
+    def dvl_callback(self, msg):
+        self.altitude_pub.publish(Float32(data=float(msg.altitude)))
+
 
     def _create_odom_pubsub(self):
         """
@@ -143,9 +162,12 @@ class SAMSMARCPublisher(Node):
             self.heading_pub.publish(compass_heading_msg)
 
             latlon_msg = convert_utm_to_latlon(transform_pose)
+            # Correct for a GeoPoint: its altitude IS height above the reference surface.
             latlon_msg.altitude = msg.pose.pose.position.z
             self.latlon_pub.publish(latlon_msg)
-            self.altitude_pub.publish(Float32(data=latlon_msg.altitude))
+            # NOTE: SmarcTopics.ALTITUDE_TOPIC is deliberately NOT published here. That topic
+            # carries bottom clearance from the DVL (see _create_altitude_pubsub); publishing z
+            # onto it made a surfaced vehicle look like it was aground. Two quantities, one word.
 
             if self.current_pose_utm is not None and self.prev_pose_utm is not None:
                 course_msg = compute_course_from_two_poses(self.prev_pose_utm, self.current_pose_utm)

@@ -1,3 +1,4 @@
+import math
 import os
 import yaml
 from dataclasses import dataclass, field
@@ -394,10 +395,20 @@ class MonitorNode(Node):
         if 'min_altitude' not in self.limits:
             return self.current_altitude_status
 
-        if self.current_altitude.data == -1:
-            # -1 is the "no bottom lock" sentinel, not a reading of zero altitude. Treat it as
-            # no information: don't fault on it, but don't count it as a healthy sample towards
-            # recovery either.
+        # ALTITUDE IS BOTTOM CLEARANCE, from the DVL altimeter and nothing else. Until
+        # 2026-08-18 sam_smarc_publisher fed this topic the DR odometry's z instead, so a
+        # vehicle floating at the surface reported ~0.00 and faulted here continuously while
+        # the DVL was reading 4.6 m. If this fault ever fires again with a value that tracks
+        # depth rather than clearance, suspect the publisher before the threshold.
+        #
+        # -1 is the smarc_msgs/DVL "invalid measurement" sentinel (dropout / no bottom lock);
+        # NaN and inf mean the same thing from other sources. All are NO INFORMATION: don't
+        # fault on them, and don't count them as healthy samples towards recovery either.
+        # Deliberately `<= -1` and not `== -1`: an exact float comparison against a sentinel
+        # that has crossed a serialisation boundary is a guard waiting to silently stop
+        # matching -- which is exactly what this guard had been doing.
+        altitude_m = self.current_altitude.data
+        if not math.isfinite(altitude_m) or altitude_m <= -1:
             return self.current_altitude_status
 
         time_diff = check_time - self.current_altitude_time

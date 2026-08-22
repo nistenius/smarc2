@@ -37,7 +37,7 @@ must be testable on a laptop, because a geometry error looks exactly like a dete
 that "does not work".
 """
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 import math
 
 
@@ -254,6 +254,105 @@ def choose_lane_geometry(rope_depth_m: float,
                         f"rope at {rope_depth_m:.2f} m inside the beam "
                         f"(off-nadir {beam.theta_min_deg:.0f}..{beam.theta_max_deg:.0f} deg, "
                         f"beam source: {beam.source}): {detail}")
+
+
+@dataclass(frozen=True)
+class EncircleGeometry:
+    """The T2 perimeter loop's depth, or a refusal that names the buoys it would miss."""
+
+    ok: bool
+    reason: str
+    depth_m: float = 0.0             # positive-down, the depth the VEHICLE flies at
+    standoff_m: float = 0.0          # horizontal distance from the buoy hull
+    visible: Tuple[str, ...] = ()
+    invisible: Tuple[str, ...] = ()
+    #: Vertical separation, in metres, between the sonar and the SHALLOWEST-bottomed buoy
+    #: that is still visible. This is the whole safety margin of the encircle: it is tens
+    #: of centimetres, not metres, and it is the number to watch.
+    worst_separation_m: float = 0.0
+
+
+def buoy_visibility(depth_m: float,
+                    buoy_extents_m: Dict[str, float],
+                    beam: BeamGeometry,
+                    standoff_m: float) -> Tuple[Tuple[str, ...], Tuple[str, ...], float]:
+    """Which buoys a side scan at `depth_m` can see from `standoff_m` away.
+
+    A FLOATING BUOY IS ALMOST ENTIRELY ABOVE THE WATER LINE, AND A SIDE SCAN SEES NOTHING
+    AT OR ABOVE ITS OWN DEPTH. So the only part of a buoy that can ever return an echo is
+    the part BELOW the transducer, and `buoy_extents_m[name]` is how far below the surface
+    each buoy reaches (its radius — the colliders are spheres centred on the water line).
+
+    That makes the T2 encircle depth a derived quantity with a very small budget, and it
+    is why the IROS 2025 survey of this farm was flown FROM THE SURFACE. Returns
+    (visible, invisible, worst_separation_m) so a caller can report which buoys it would
+    miss by name rather than discovering an incomplete map after the fact.
+    """
+    vis, invis, worst = [], [], None
+    for name in sorted(buoy_extents_m):
+        dz = float(buoy_extents_m[name]) - depth_m      # below the sonar = positive
+        if dz > 0.0 and beam.sees(dz, standoff_m):
+            vis.append(name)
+            worst = dz if worst is None else min(worst, dz)
+        else:
+            invis.append(name)
+    return tuple(vis), tuple(invis), (worst or 0.0)
+
+
+def choose_encircle_geometry(buoy_extents_m: Dict[str, float],
+                             beam: BeamGeometry,
+                             standoff_m: float,
+                             candidate_depths_m: Sequence[float] = (0.0, 0.1, 0.2, 0.3),
+                             requested_depth_m: Optional[float] = None) -> EncircleGeometry:
+    """Pick the encircle depth, or refuse and say which buoys would be invisible.
+
+    Visibility is monotonically *worse* with depth (a deeper sonar has less of the buoy
+    below it), so the shallowest candidate is always the best one and this is a search
+    only so that the refusal can quote what it tried.
+
+    `requested_depth_m` overrides the search: it exists so that a mission configured to
+    encircle at, say, the rope depth gets a REFUSAL NAMING THE BUOYS instead of a survey
+    that quietly returns nothing. That failure mode — "we looked and found nothing" — is
+    the most expensive output an inspection mission has, and it is indistinguishable from
+    a real empty farm unless something checks the geometry first.
+    """
+    if not buoy_extents_m:
+        return EncircleGeometry(False, "the prior lists no buoy extents, so nothing can be "
+                                       "said about what the encircle would see")
+    if standoff_m <= 0.0:
+        return EncircleGeometry(False, f"encircle standoff {standoff_m:.2f} m is not outside "
+                                       "the farm")
+
+    def _at(depth):
+        vis, invis, worst = buoy_visibility(depth, buoy_extents_m, beam, standoff_m)
+        return EncircleGeometry(
+            ok=not invis,
+            reason=("all %d buoys are below the sonar at %.2f m and inside the beam at "
+                    "%.1f m standoff" % (len(vis), depth, standoff_m)) if not invis else
+                   ("at %.2f m depth the side scan cannot see %s: a buoy only reaches "
+                    "%.2f m below the surface, and a side scan sees nothing at or above "
+                    "its own depth (beam %s)"
+                    % (depth, ", ".join(invis),
+                       min(buoy_extents_m[b] for b in invis), beam.source)),
+            depth_m=round(depth, 3), standoff_m=round(standoff_m, 3),
+            visible=vis, invisible=invis, worst_separation_m=round(worst, 3))
+
+    if requested_depth_m is not None:
+        return _at(float(requested_depth_m))
+
+    tried = []
+    for d in candidate_depths_m:
+        cand = _at(d)
+        if cand.ok:
+            return cand
+        tried.append(d)
+    deepest_possible = min(buoy_extents_m.values())
+    return EncircleGeometry(
+        False,
+        "no encircle depth in %s puts every buoy below the sonar: the shallowest-bottomed "
+        "buoy reaches only %.2f m below the surface, so the loop must be flown above that "
+        "or those buoys cannot be detected at all"
+        % (", ".join("%.2f" % d for d in tried), deepest_possible))
 
 
 #: Must match `SSS_Pub.SoundSpeedMS` in SMARCAssets. The publisher expresses the sonar's

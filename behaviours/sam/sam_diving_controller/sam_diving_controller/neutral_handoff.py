@@ -71,6 +71,30 @@ DEFAULT_SURFACE_DEPTH_M = 0.35  # "at the surface" for a hull whose sensor sits 
 DEFAULT_VBS_TOL_PCT = 5.0
 
 
+def at_surface(depth_m: Optional[float],
+               surface_depth_m: float = DEFAULT_SURFACE_DEPTH_M) -> Optional[bool]:
+    """Is the hull at the surface, according to its OWN depth reading?
+
+    Extracted from `neutral_handoff()` on 2026-08-19 so there is exactly ONE definition of "at
+    the surface" in this tree, and `neutral_handoff` below now calls it rather than repeating
+    the comparison. The second caller is the recorder in `data-cube/services/unity_bridge/
+    bridge_node.py`: the post-mission stop policy (stop and save the bag once the vehicle has
+    been surfaced and idle for five minutes) needs the same fact, and a recorder carrying its
+    own private threshold is the two-implementations-of-one-safety-decision shape SETTLED 3l
+    already charges this project for.
+
+    Returns None -- never False -- when the vehicle has not reported a depth. ABSENT FEEDBACK IS
+    NOT ARRIVAL, and it is equally not a refutation: a caller has to be able to tell "it says it
+    is down" from "it has said nothing", because those need different words in front of an
+    operator. `neutral_handoff`'s own timeout branch is where "it never said" becomes a decision.
+
+    Magnitude, not sign -- see this module's SIGN CONVENTION note.
+    """
+    if depth_m is None:
+        return None
+    return abs(depth_m) <= surface_depth_m
+
+
 def neutral_handoff(
     ticks: int,
     depth_m: Optional[float],
@@ -95,10 +119,12 @@ def neutral_handoff(
     if ticks < min_ticks:
         return HandoffVerdict(False, False, f"holding neutral — {ticks}/{min_ticks} commands sent")
 
-    at_surface = depth_m is not None and abs(depth_m) <= surface_depth_m
+    # One definition of "at the surface", shared with the recorder -- see at_surface() above.
+    # `is True` because at_surface returns None for "has not said", which is not arrival.
+    surfaced = at_surface(depth_m, surface_depth_m) is True
     at_neutral = vbs_pct is not None and abs(vbs_pct - vbs_target_pct) <= vbs_tol_pct
 
-    if at_surface and at_neutral:
+    if surfaced and at_neutral:
         return HandoffVerdict(
             True, True,
             f"surfaced ({abs(depth_m):.2f} m) with VBS at neutral ({vbs_pct:.0f}%) — releasing actuators")
@@ -109,7 +135,7 @@ def neutral_handoff(
         missing = []
         if depth_m is None:
             missing.append("no depth feedback")
-        elif not at_surface:
+        elif not surfaced:
             missing.append(f"still {abs(depth_m):.2f} m down")
         if vbs_pct is None:
             missing.append("no VBS feedback")
@@ -124,7 +150,7 @@ def neutral_handoff(
     waiting = []
     if depth_m is None:
         waiting.append("depth not reported")
-    elif not at_surface:
+    elif not surfaced:
         waiting.append(f"{abs(depth_m):.2f} m down")
     if vbs_pct is None:
         waiting.append("VBS not reported")

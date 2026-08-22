@@ -20,7 +20,8 @@ from ..vehicles.sensor import SensorNames
 from .i_has_vehicle_container import HasVehicleContainer
 from .i_has_clock import HasClock
 
-from wasp_bt.waraps.waraps_task_handler import WaraPSTaskHandler, HasWaraPSTaskHandler, WaraPSTaskStates
+from wasp_bt.waraps.waraps_task_handler import (WaraPSTaskHandler, HasWaraPSTaskHandler,
+                                                WaraPSTaskStates, BT_PROVIDED_TASKS)
 
 from smarc_action_base.smarc_action_base import ActionType
 from wasp_bt.bt.client import BTActionClient
@@ -46,6 +47,8 @@ from .actions import A_Abort,\
                     A_Chilling,\
                     A_WaitForData,\
                     A_ClearCurrentTask
+
+from .farm_inspection import A_FarmInspection, A_SurfaceAndReport, FARM_INSPECTION_TASK
 
 class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
     def __init__(self,
@@ -176,6 +179,37 @@ class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
         ])
 
         return task_tree
+
+    def _bt_provided_task_tree(self, task_name: str, action_client: BTActionClient):
+        """The subtree for a task the TREE executes itself, e.g. `auv-farm-inspection`.
+
+        Structurally identical to `_one_task_tree` — same guards, same status gate, same
+        clear-when-done — with the single `A_ActionClient` swapped for the behaviour that
+        streams many goals through THAT SAME CLIENT. Ending with `A_SurfaceAndReport` is
+        invariant 5b: the tree is the only thing that knows a mission is over, and today it
+        just falls through to `A_Chilling` while the controller holds its last depth.
+
+        `memory=True` on the inner sequence, unlike `_one_task_tree`: these two children are
+        SEQUENTIAL PHASES of one task, not a re-evaluated guard chain. Without memory, a
+        SUCCESS from the inspection would be re-run from the top on the next tick and the
+        vehicle would fly the whole survey again.
+        """
+        robot_name = self._task_handler.wara_ps_dict["name"]
+        node = self._task_handler._node
+        return Sequence(f"S_{task_name}", memory=False, children=[
+            C_MissionNotInError(self._task_handler),
+            C_TaskIs(self._task_handler, task_name),
+            Fallback("F_StatusCheck", memory=False, children=[
+                C_TaskStatus(self._task_handler, WaraPSTaskStates.STARTED.value),
+                C_TaskStatus(self._task_handler, WaraPSTaskStates.RESUMED.value),
+                C_TaskStatus(self._task_handler, WaraPSTaskStates.RUNNING.value),
+            ]),
+            Sequence(f"S_{task_name}_phases", memory=True, children=[
+                A_FarmInspection(action_client, self, self._task_handler, node, robot_name),
+                A_SurfaceAndReport(action_client, self, self._task_handler, node, robot_name),
+            ]),
+            A_ClearCurrentTask(self._task_handler),
+        ])
 
     def _get_ready_tree(self, task_name: str, action_client: BTActionClient):
         """
@@ -312,6 +346,17 @@ class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
 
                 task_tree = self._one_task_tree(task_name, action_client)
                 mission_task_children.append(task_tree)
+
+                # Tasks the TREE provides on top of this same action server. They reuse this
+                # client instance — one client, one server, one writer (SETTLED §1c and
+                # invariant 12) — and appear only while the handler lists them as available,
+                # which happens only while the provider's heartbeat is arriving.
+                available_names = [t["name"] for t in self._task_handler.get_available_tasks()]
+                for provided, provider in BT_PROVIDED_TASKS.items():
+                    if provider != task_name or provided not in available_names:
+                        continue
+                    mission_task_children.append(
+                        self._bt_provided_task_tree(provided, action_client))
 
         # make a fallback out of mission_task_children
         mission_task_fallback = Fallback("F_Tasks", memory=False, children=mission_task_children)

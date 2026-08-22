@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             'sss_farm_detector = sam_farm_inspection.sss_farm_detector:main',
             'farm_localizer = sam_farm_inspection.farm_localizer_node:main',
+            'farm_planner = sam_farm_inspection.farm_planner_node:main',
         ],
     },
 )

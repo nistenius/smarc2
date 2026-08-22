@@ -3,7 +3,7 @@ import sys
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import Float32, Float64, Bool
+from std_msgs.msg import Float32, Float64, Bool, String
 from smarc_msgs.msg import ThrusterRPM, PercentStamped
 from smarc_control_msgs.msg import Topics as ControlTopics
 from smarc_control_msgs.msg import MissionEvent 
@@ -43,6 +43,16 @@ class DivePub(IDivePub):
         self._joy_thrust_vector_pub = node.create_publisher(Float64, ControlTopics.ELEVATOR_PID_CTRL, 10)
         self._joy_assisted_driving_pub = node.create_publisher(Bool, ControlTopics.ASSIST_ENABLE, qos_profile=10)
         self._mission_event_pub = node.create_publisher(MissionEvent, "ctrl/conv/mission_event", qos_profile=10)
+        # THE HAND-OFF, SAID OUT LOUD (2026-08-17). `neutral_handoff()` already decides when
+        # it is safe to let go of the actuators, and whether the vehicle EARNED that or the
+        # timeout gave it away — and until now that verdict existed only inside this process
+        # and in a log line. The behaviour tree's `A_SurfaceAndReport` (invariant 5b's other
+        # half) has to wait for exactly this, and the alternative was for it to re-derive the
+        # answer from depth and VBS feedback: a second implementation of a safety decision,
+        # which is how two components come to disagree about whether the vehicle surfaced.
+        # This node is the SOLE publisher of the topic (invariant 11).
+        # Format: "<RELEASED|HOLDING>|<confirmed|unconfirmed>|<reason>".
+        self._handoff_pub = node.create_publisher(String, "ctrl/neutral_handoff", 10)
 
         # Messages
         self._vbs_msg = PercentStamped()
@@ -204,6 +214,13 @@ class DivePub(IDivePub):
                 vbs_tol_pct=self.param.get('neutral_vbs_tol_pct', 5.0),
             )
             self._loginfo(f"NEUTRAL hand-off: {verdict.reason}")
+            # Publish EVERY tick, not only on release: "the controller has not let go yet"
+            # is information the tree needs, and a topic that only speaks on success leaves
+            # a waiting consumer unable to tell "not yet" from "this node is dead".
+            self._handoff_pub.publish(String(data="{}|{}|{}".format(
+                "RELEASED" if verdict.release else "HOLDING",
+                "confirmed" if verdict.confirmed else "unconfirmed",
+                verdict.reason)))
             if verdict.release:
                 if not verdict.confirmed:
                     # Loud, because an unconfirmed release means the vehicle is being left with

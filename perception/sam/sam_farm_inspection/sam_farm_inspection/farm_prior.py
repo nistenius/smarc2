@@ -25,6 +25,32 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
+class GeoMap:
+    """The prior's own linear metres -> WGS84 map, and what it costs.
+
+    Not a convenience: a planner that has to turn metres into waypoint lat/lon and has no
+    projection library reaches for metres/cos(lat), which ignores the difference between
+    Unity's +Z (UTM 32N GRID north) and true north — 2.081 deg at Kristineberg, i.e. 8.6 m
+    across the 237 m transit. This map is the full 2x2 Jacobian, fitted by pyproj in the
+    generator, and it carries its own measured worst-case error so a consumer can decide
+    whether it is good enough instead of hoping.
+    """
+
+    origin_lat: float
+    origin_lon: float
+    dlat_dx: float          # degrees per metre (NOT microdegrees; converted on load)
+    dlat_dz: float
+    dlon_dx: float
+    dlon_dz: float
+    max_error_m: float
+    basis: str
+
+    def to_latlon(self, x: float, z: float) -> Tuple[float, float]:
+        return (self.origin_lat + self.dlat_dx * x + self.dlat_dz * z,
+                self.origin_lon + self.dlon_dx * x + self.dlon_dz * z)
+
+
+@dataclass(frozen=True)
 class FarmPrior:
     path: str
     buoys: Dict[str, Tuple[float, float]]          # name -> Unity (x, z)
@@ -40,6 +66,17 @@ class FarmPrior:
     encircle_standoff_m: float
     lane: Dict[str, object]
     caveats: List[str]
+    #: How far below the water line each buoy reaches — the only part of it a side scan
+    #: can ever see. Decides the encircle depth; see `encircle`.
+    buoy_extents_m: Dict[str, float]
+    hull_xz: List[Tuple[float, float]]
+    perimeter_order: List[str]
+    launch_xz: Tuple[float, float]
+    launch_latlon: Tuple[float, float]
+    transit_speed_ms: float
+    r_stop_at_scan_speed_m: float
+    encircle: Dict[str, object]
+    geo: GeoMap
 
     @property
     def n_buoys(self) -> int:
@@ -128,6 +165,33 @@ def load_farm_prior(path: Optional[str] = None) -> FarmPrior:
     # the scene cannot execute.
     lane = lanes.get("as_shipped", {})
 
+    # Blocks added 2026-08-17 for the P5 planner. A prior that predates them is REFUSED
+    # rather than defaulted: the planner would otherwise fall back to an invented geo map
+    # or an invented encircle depth, and both fail silently — the mission flies and sees
+    # nothing. Regenerating is one command; guessing is a wrong survey.
+    geo_d = doc.get("geo")
+    if not isinstance(geo_d, dict):
+        raise PriorRefusal(
+            f"{path} has no `geo` block. It was generated before 2026-08-17 and the planner "
+            f"will not invent a metres->lat/lon conversion (the obvious one, metres/cos(lat), "
+            f"ignores grid-vs-true north and is 8.6 m wrong over this transit). Regenerate "
+            f"with make_farm_prior.py.")
+    enc = (doc.get("sonar") or {}).get("encircle")
+    if not isinstance(enc, dict):
+        raise PriorRefusal(
+            f"{path} has no `sonar.encircle` block, so nothing has checked whether the "
+            f"encircle depth can see the buoys at all. Regenerate with make_farm_prior.py.")
+
+    extents = {b["name"]: float(b["submerged_extent_m"])
+               for b in farm.get("buoys", []) if "submerged_extent_m" in b}
+    if len(extents) != len(buoys):
+        raise PriorRefusal(
+            f"{path} does not give every buoy a `submerged_extent_m`. That is how far below "
+            f"the water line the buoy reaches, and it is the only part of it a side scan can "
+            f"see; without it the encircle depth is a guess. Regenerate.")
+
+    launch = doc.get("launch") or {}
+    prof = doc.get("profile") or {}
     seabed = farm.get("seabed_depth_range_m") or [0.0, 0.0]
     return FarmPrior(
         path=path,
@@ -144,4 +208,25 @@ def load_farm_prior(path: Optional[str] = None) -> FarmPrior:
         encircle_standoff_m=float(prof.get("encircle_standoff_m", 0.0)),
         lane=dict(lane),
         caveats=list(doc.get("caveats") or []),
+        buoy_extents_m=extents,
+        hull_xz=[(float(p[0]), float(p[1])) for p in farm.get("buoy_hull_unity_xz", [])],
+        perimeter_order=list(farm.get("perimeter_order") or []),
+        launch_xz=(float(launch.get("unity_xz", (0.0, 0.0))[0]),
+                   float(launch.get("unity_xz", (0.0, 0.0))[1])),
+        launch_latlon=(float(launch.get("lat", 0.0)), float(launch.get("lon", 0.0))),
+        transit_speed_ms=float(prof.get("transit_speed_ms", 0.0)),
+        r_stop_at_scan_speed_m=float(prof.get("r_stop_at_scan_speed_m", 0.0)),
+        encircle=dict(enc),
+        geo=GeoMap(
+            origin_lat=float(geo_d["origin_lat"]),
+            origin_lon=float(geo_d["origin_lon"]),
+            # Stored as MICRODEGREES per metre so the generator's 6-decimal YAML rounding
+            # does not throw away four significant figures. Converted once, here.
+            dlat_dx=float(geo_d["dlat_dx_udeg_per_m"]) * 1e-6,
+            dlat_dz=float(geo_d["dlat_dz_udeg_per_m"]) * 1e-6,
+            dlon_dx=float(geo_d["dlon_dx_udeg_per_m"]) * 1e-6,
+            dlon_dz=float(geo_d["dlon_dz_udeg_per_m"]) * 1e-6,
+            max_error_m=float(geo_d.get("max_error_m", 0.0)),
+            basis=str(geo_d.get("basis", "unstated")),
+        ),
     )

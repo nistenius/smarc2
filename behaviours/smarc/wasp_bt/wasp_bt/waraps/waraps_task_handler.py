@@ -77,6 +77,24 @@ class HasWaraPSTaskHandler:
         self._wara_ps_dict = value
         self._robot_name = value["name"] if value else None
 
+#: WARA-PS tasks the BEHAVIOUR TREE provides itself, mapped to the action server whose
+#: pipeline each one streams through.
+#:
+#: Every other available task appears because an ACTION SERVER published a heartbeat
+#: (`_action_hb_callback`). `auv-farm-inspection` has no server of its own on purpose: it is
+#: a sequence of ordinary `auv_depth_move_to` goals chosen by the farm planner, and giving it
+#: a second server on that action name is precisely the defect that stopped every mission at
+#: waypoint 1 for a week (SETTLED §1c, the duplicate bringup).
+#:
+#: It is therefore registered as available **exactly when its provider's heartbeat arrives**,
+#: with the SAME `ros_name`, and it ages out through the same liveliness timeout. That is
+#: consumer-side evidence, not a flag: if the diving controller's action server dies, the farm
+#: task disappears from `tasks-available` on its own, because the thing it needs is gone.
+BT_PROVIDED_TASKS = {
+    "auv-farm-inspection": "auv-depth-move-to",
+}
+
+
 class WaraPSTaskHandler:
     def __init__(
         self,
@@ -103,6 +121,17 @@ class WaraPSTaskHandler:
         self.tasks_available = []
         self.past_tasks = []
         self.tasks_executing = []
+        # Mission-clock progress state (see _mission_progress / mission_timer_state). All None
+        # or 0 until a start-tst is accepted: nothing here may make a display claim a mission
+        # exists, and an absent estimate must render as "--" rather than as a number.
+        self._mission_wp_total = 0
+        self._mission_past_base = 0
+        self._mission_wp_done_seen = 0
+        self._mission_last_wp_at = None
+        # Flat, and all-None until something has actually flown: a display must be able to say
+        # "this vehicle has never flown" rather than draw an empty run as a finished one.
+        self._last_mission_summary = {"last_elapsed_s": None, "last_limit_s": None,
+                                      "last_wp_done": None, "last_wp_total": None}
 
         self.aborted_flag = False
         self.emergency_flag = False
@@ -142,6 +171,23 @@ class WaraPSTaskHandler:
 
         # publishers for bt head
         self._wasp_bt_tip_pub = node.create_publisher(String, Topics.WARA_PS_SENSOR_BT_TOPIC, 10)
+
+        # THE MISSION CLOCK, PUBLISHED (Ivan, 2026-08-18).
+        #
+        # `mission_start_time` and `mission_timeout` decide whether a mission lives or dies, and
+        # until today they existed ONLY as attributes on this object. Nothing outside could see
+        # them, so a 130 m plan was aborted at 301 s eight times over several weeks and read as
+        # a vehicle fault every time. Ivan, immediately after the first mission that survived:
+        # "for next round of HUD it would be useful with timer, total mission passed, countdown
+        # to end". A limit that can end a mission has to be observable while the mission runs.
+        #
+        # RELATIVE topic on purpose: the node already carries the robot namespace, so this
+        # resolves to /<robot>/ctrl/mission_timer and a second vehicle gets its own without any
+        # string surgery. Deliberately a plain diagnostic channel rather than a WARA-PS one, so
+        # MC, the Unity HUD and a bag can all read it without knowing the WARA-PS envelope.
+        # JSON in a String for the same reason: a new .msg would need a rebuild in every
+        # consumer before anything could read it.
+        self._mission_timer_pub = node.create_publisher(String, "ctrl/mission_timer", 10)
 
 
         # Subscriptions for WARA-PS command topics
@@ -261,14 +307,51 @@ class WaraPSTaskHandler:
         self._wara_ps_tst_exec_info_pub.publish(msg)
         # self._node.get_logger().info('Published TST Execution Info message')
 
+        # Published EVERY tick, including when no mission is running: a consumer must be able to
+        # tell "no mission" from "this node has stopped talking". Absent is not empty.
+        self._publish_mission_timer()
+
+        # A FINISHED MISSION STOPS BEING TIMED, WHATEVER ELSE IS TRUE (2026-08-19, measured).
+        #
+        # This used to live inside the guard below, and mission #37's bag is what that cost:
+        # `ctrl/mission_timer` read `elapsed_s 8001.4, limit_s 2995.0, fraction 2.668, state:
+        # running` while the vehicle sat surfaced and idle -- 6,856 s after the task queue
+        # emptied. The reasoning that finds it is entirely in that one line: `state: running`
+        # with a non-None `limit_s` means the first TWO clauses of the guard were satisfied, so
+        # only the third can have been false, so `emergency_flag` was True. And it was: at
+        # +1145.1, the instant the vehicle surfaced to end the mission, `smarc/vehicle_health`
+        # went 0 -> 2 with `Fault detected: low altitude! Current altitude: 0.28, Min altitude:
+        # 0.5` -- the surfaced vehicle reading its own depth as bottom clearance, which is the
+        # 2026-08-18 "altitude meant two things" defect arriving through the health checker
+        # instead of through min_altitude. The flag latches (only _reset_emergency_cb clears it),
+        # so from that moment the timer could neither fire NOR STOP.
+        #
+        # RETIREMENT IS NOT ENFORCEMENT and must not share its guard. Whether an already-aborted
+        # mission still needs a timeout is arguable -- it is the guard below, and it is Ivan's
+        # call (a mission that ended is not a mission that needs a second abort). Whether a
+        # mission that has ENDED should keep being timed is not arguable at all.
+        if self.mission_start_time is not None and self.tasks_executing == []:
+            self.mission_start_time = None
+            self.mission_timeout = None
+
         # ABORT IF MISSION TIMOUT HAS BEEN EXCEEDED
         # do this only if there is a mission running
         if self.mission_start_time is not None and self.mission_timeout is not None and self.emergency_flag is False:
-            if self.current_time() - self.mission_start_time > self.mission_timeout:
-                self._node.get_logger().warn(f"Mission timeout exceeded. Aborting mission.")
-                # set emergency flag
-                self.emergency_flag = True
-                # publish abort command
+            elapsed = self.current_time() - self.mission_start_time
+            if elapsed > self.mission_timeout:
+                # THROUGH _apply_abort, NOT AROUND IT (2026-08-18). This used to set
+                # `emergency_flag = True` inline, which aborted the mission correctly and told
+                # nobody why: last_abort_origin stayed empty, so MC's readiness row read
+                # "cause not recorded" and the operator was left guessing at a vehicle fault
+                # when the real answer was "the plan needed more time than it was given".
+                # The detail carries both numbers so the log says how badly, not just that.
+                self._apply_abort(
+                    self.ABORT_ORIGIN_MISSION_TIMEOUT,
+                    f"the mission ran out of time: {elapsed:.0f} s elapsed against a "
+                    f"{self.mission_timeout:.0f} s limit. The plan may simply need longer than "
+                    f"it was allowed -- check the mission timeout before blaming the vehicle",
+                    respond=False)
+                # The WARA-PS feedback stays, unchanged in shape: no abort path may get quieter.
                 abort_msg = {
                     "agent-uuid": self._wara_ps_dict["agent-uuid"],
                     "com-uuid": "",
@@ -287,14 +370,12 @@ class WaraPSTaskHandler:
                 self.mission_start_time = None
                 self.mission_timeout = None
                 return False
-            if self.tasks_executing == []: # no tasks are executing
-                # in the case that a mission was initiated and completed within time, reset mission timer to Nones
-                # `if`, not `elif`: whether to retire a finished mission's timers has nothing to do
-                # with whether the timeout was exceeded -- and the branch above now returns, so an
-                # `elif` here would read as live code that can never run.
-                self.mission_start_time = None
-                self.mission_timeout = None
-    
+            # (The "no tasks are executing -> retire the timers" branch used to be here. It moved
+            #  ABOVE this guard on 2026-08-19 -- see the note there. Left as a comment rather than
+            #  as an `if` that can no longer be reached: by the time control gets this far, the
+            #  earlier retirement has already run this tick, so a copy here would be dead code
+            #  that still reads like the thing doing the work.)
+
         return True
     
     def _read_level_1_heartbeat_cb(self, data: String):
@@ -359,8 +440,10 @@ class WaraPSTaskHandler:
 
             # log last seen time
             self._node.get_logger().info(f"Found new action server: {action_name} at {now_time}")
-
-            return
+            # NOTE (2026-08-17): this branch used to `return` here. The return was redundant —
+            # the block below is the `else` of this `if` and could never run after it — and it
+            # skipped the BT-provided-task refresh at the bottom on the FIRST heartbeat, which
+            # is the one that matters when a stack has just come up.
 
         # if this action server is already in the list of available tasks, update the last seen time
         else:
@@ -373,7 +456,42 @@ class WaraPSTaskHandler:
                     break
             # log last seen time
             # self._node.get_logger().info(f"Updated action server: {action_name} at {now_time}")
-        
+
+        # Tasks the tree itself provides on top of this action server (see BT_PROVIDED_TASKS).
+        # Refreshed on every heartbeat, so they live and die with their provider.
+        self._refresh_bt_provided_tasks(parsed_action_name, action_name, now_time)
+
+    def _refresh_bt_provided_tasks(self, provider_task_name, provider_ros_name, now_time):
+        """Add/refresh any BT-provided task whose provider just reported in.
+
+        The derived task carries the provider's OWN `ros_name`, which is what makes
+        `ros_bt` hand it the cached action client rather than build a second one.
+        """
+        for name, provider in BT_PROVIDED_TASKS.items():
+            if provider != provider_task_name:
+                continue
+            for task in self.tasks_available:
+                if task["name"] == name:
+                    task["last_seen"] = now_time
+                    break
+            else:
+                self.tasks_available.append({
+                    "name": name,
+                    "signals": [
+                        WaraPSCommandSignals.ABORT.value,
+                        WaraPSCommandSignals.ENOUGH.value,
+                        WaraPSCommandSignals.PAUSE.value,
+                        WaraPSCommandSignals.CONTINUE.value,
+                    ],
+                    "last_seen": now_time,
+                    "ros_name": provider_ros_name,
+                    # Marked, so nothing downstream mistakes it for a server that exists.
+                    "provided_by": "behaviour_tree",
+                })
+                self._node.get_logger().info(
+                    f"Behaviour-tree task '{name}' is available: its provider "
+                    f"'{provider}' reported in on {provider_ros_name}")
+
 
     def _send_exec_response(self, com_uuid, response):
         """
@@ -804,6 +922,14 @@ class WaraPSTaskHandler:
             self.tasks_executing.extend(tasks_to_start)
             # start mission timer
             self.mission_start_time = self.current_time()
+            # ...and the progress baseline for the mission clock. `past_tasks` accumulates
+            # across missions, so "how many of THIS mission are done" is measured against where
+            # the list stood when this one was accepted -- not against its length, which would
+            # report the previous run's waypoints as already flown.
+            self._mission_wp_total = len(tasks_to_start)
+            self._mission_past_base = len(self.past_tasks)
+            self._mission_wp_done_seen = 0
+            self._mission_last_wp_at = self.mission_start_time
 
             # Publish acknowledgment that TST was accepted and queued
             self._send_tst_response(com_uuid, "accepted")
@@ -1008,6 +1134,134 @@ class WaraPSTaskHandler:
     ABORT_ORIGIN_OPERATOR_C2 = "operator_c2"
     ABORT_ORIGIN_VEHICLE_STACK = "vehicle_stack"
     ABORT_ORIGIN_BT_HEALTH = "bt_health"
+    # The fourth origin, added 2026-08-18 after it cost days. The mission-timeout path set
+    # `emergency_flag = True` inline and never went through _apply_abort, so it recorded no
+    # origin at all -- Mission Control offered "Clear emergency (cause not recorded)" and the
+    # operator had nothing to act on. `~/.ros/log` held EIGHT of these, each read as a fresh
+    # mystery. An abort that cannot name itself is the defect this constant list exists for.
+    ABORT_ORIGIN_MISSION_TIMEOUT = "mission_timeout"
+
+    def _mission_progress(self, now: float, elapsed: float) -> dict:
+        """Waypoints done / total, and pace-based estimates for the rest.
+
+        PROGRESS IS OBSERVED, NOT INSTRUMENTED. This edge-detects `past_tasks` growing rather
+        than hooking the task lifecycle: the lifecycle is the part that flies the vehicle, and a
+        display has no business adding branches to it. If the list is not what this expects the
+        estimates simply go None, which the HUD renders as "--".
+
+        THE ESTIMATES ARE PACE, AND THEY SAY SO. Average seconds per completed waypoint,
+        extrapolated. That is honest for a plan of similar legs and wrong for a plan whose last
+        leg is ten times the first -- which is exactly why the HUD prefixes them with "~" and
+        why the mission TIMEOUT is shown alongside rather than replaced by them. A hard limit
+        and a guess must never be printed as if they were the same kind of number: today's
+        entire 300 s hunt was one number being mistaken for another.
+        """
+        total = self._mission_wp_total
+        if not total:
+            return {"wp_total": None, "wp_done": None, "wp_current": None,
+                    "eta_finish_s": None, "eta_next_s": None}
+        try:
+            done = max(0, len(self.past_tasks) - self._mission_past_base)
+        except (TypeError, AttributeError):
+            return {"wp_total": total, "wp_done": None, "wp_current": None,
+                    "eta_finish_s": None, "eta_next_s": None}
+        done = min(done, total)
+        if done != self._mission_wp_done_seen:
+            self._mission_wp_done_seen = done
+            self._mission_last_wp_at = now
+        out = {"wp_total": total, "wp_done": done,
+               "wp_current": min(done + 1, total),
+               "eta_finish_s": None, "eta_next_s": None}
+        if done > 0:
+            per_wp = elapsed / done
+            out["eta_finish_s"] = round(per_wp * (total - done), 1)
+            in_current = now - (self._mission_last_wp_at or now)
+            # Never negative: a leg already running longer than the average is "due", not
+            # "overdue by a guess" -- clamping here keeps a soft estimate from reading like the
+            # hard overrun that the timeout row shows.
+            out["eta_next_s"] = round(max(0.0, per_wp - in_current), 1)
+        return out
+
+    def mission_timer_state(self, now: float = None) -> dict:
+        """The mission clock as data. Pure apart from the clock read, so it can be tested.
+
+        Four fields and a state word, chosen so a display never has to do arithmetic it might
+        get wrong, and never has to guess what silence means:
+
+          running   a mission is timing right now
+          idle      the vehicle is fine, nothing is being timed  (NOT the same as running=0)
+          untimed   a mission is running with no timeout set at all -- say so rather than
+                    render a countdown from a limit that does not exist
+
+        `fraction` is elapsed/limit, because "600 s left of 1188 with one waypoint to go" is the
+        reading that would have caught the 300 s bug in five seconds, and a bare seconds count
+        is not that reading.
+        """
+        if now is None:
+            now = self.current_time()
+        if self.mission_start_time is None:
+            # IDLE STILL REPORTS (Ivan, 2026-08-18): "we could keep the row there even in
+            # idling, perhaps just with previous mission data or empty". A row that disappears
+            # between missions is indistinguishable from a feature that was never built, and
+            # the operator loses the one summary of the run that just finished.
+            return {"state": "idle", "elapsed_s": None, "limit_s": None,
+                    "remaining_s": None, "fraction": None,
+                    "wp_total": None, "wp_done": None, "wp_current": None,
+                    "eta_finish_s": None, "eta_next_s": None,
+                    "emergency": bool(self.emergency_flag),
+                    **self._last_mission_summary}
+        elapsed = max(0.0, float(now) - float(self.mission_start_time))
+        prog = self._mission_progress(now, elapsed)
+        if not self.mission_timeout:
+            return {"state": "untimed", "elapsed_s": round(elapsed, 1), "limit_s": None,
+                    "remaining_s": None, "fraction": None, **prog,
+                    "emergency": bool(self.emergency_flag),
+                    **self._last_mission_summary}
+        limit = float(self.mission_timeout)
+        remaining = limit - elapsed
+        state = {
+            "state": "running",
+            "elapsed_s": round(elapsed, 1),
+            "limit_s": round(limit, 1),
+            # A NEW FIELD, DELIBERATELY NOT A NEW `state` WORD (2026-08-19). While the emergency
+            # flag is up the limit above is NOT being enforced -- the guard in lvl_3_heartbeat
+            # skips it -- so a display rendering this as a live countdown is telling the operator
+            # a limit will act when it will not. Mission #37 read `fraction 2.668, state:
+            # running` for nearly two hours on exactly that basis.
+            # A field rather than a fourth state word because the Unity dashboard scrapes this
+            # JSON with a deliberately minimal parser (see _last_mission_summary's own note):
+            # an unknown KEY is ignored, an unknown `state` renders as nothing at all. Whether
+            # the timeout SHOULD still be enforced under an emergency is Ivan's call; reporting
+            # honestly that it currently is not, is not.
+            "emergency": bool(self.emergency_flag),
+            # Allowed to go NEGATIVE on purpose: clamping at zero would hide an overrun that
+            # has not yet been acted on, and "-4 s" is exactly the thing worth seeing.
+            "remaining_s": round(remaining, 1),
+            "fraction": round(elapsed / limit, 3) if limit > 0 else None,
+            **prog,
+            **self._last_mission_summary,
+        }
+        # Keep a summary so the idle row has something true to show afterwards. Written every
+        # tick rather than on a "mission ended" event, because there are several ways a mission
+        # can end (complete, abort, timeout) and a summary that only survives the tidy one is
+        # the summary you least need.
+        # FLAT KEYS, not a nested object. The Unity dashboard scrapes this JSON with a
+        # deliberately minimal parser (JsonUtility would need a [Serializable] mirror class and
+        # silently yields 0 for anything missing -- which is how "no data" becomes "zero" on a
+        # dashboard). A nested "last" would force that parser to grow nesting for one field.
+        self._last_mission_summary = {
+            "last_elapsed_s": state["elapsed_s"], "last_limit_s": state["limit_s"],
+            "last_wp_done": prog["wp_done"], "last_wp_total": prog["wp_total"],
+        }
+        return state
+
+    def _publish_mission_timer(self):
+        try:
+            msg = String()
+            msg.data = json.dumps(self.mission_timer_state())
+            self._mission_timer_pub.publish(msg)
+        except Exception:   # pragma: no cover -- a diagnostic must never break the tree
+            pass
 
     def _apply_abort(self, origin: str, detail: str, respond: bool, respond_to: str = None):
         """Do the aborting. One body, three callers, and the origin travels with it.

@@ -172,23 +172,31 @@ class WaraPSVehicle():
         self._wara_ps_sensor_info_pub.publish(msg)
 
                                     
-        # 2. publish position data with altitude from dedicated altitude topic
+        # 2. publish position data
         try:
             lat = self._vehicle_state[SensorNames.GLOBAL_POSITION]['lat']
             lon = self._vehicle_state[SensorNames.GLOBAL_POSITION]['lon']
-            
-            # Get altitude from dedicated SMaRC altitude topic with proper validation
-            alt = 0  # Default altitude
+
+            # This is a GeoPoint, so its "altitude" means HEIGHT ABOVE THE REFERENCE SURFACE --
+            # a different quantity from SensorNames.ALTITUDE, which is bottom clearance off the
+            # DVL and is what min_altitude gates on. Read DEPTH, which carries the odometry z.
+            #
+            # Until 2026-08-18 this read SensorNames.ALTITUDE, and got the right number only
+            # because sam_smarc_publisher was publishing that same odometry z onto BOTH topics.
+            # That duplicate is what made a surfaced vehicle report ~0 m of bottom clearance and
+            # flap vehicle_health READY <-> ERROR. Fixing the publisher to send real DVL
+            # clearance would have silently changed the number reported here, so this consumer
+            # now names the quantity it actually wants. The value published is unchanged.
+            alt = 0  # Default
             try:
-                alt_data = self._vehicle_state[SensorNames.ALTITUDE][0]
+                alt_data = self._vehicle_state[SensorNames.DEPTH][0]
                 if self._is_valid_sensor_value(alt_data):
                     alt = alt_data
                 elif alt_data is not None:
-                    # Log warning for invalid altitude values
-                    self._node.get_logger().warn(f"Invalid altitude value detected: {alt_data}. Using default altitude 0.")
+                    self._node.get_logger().warn(f"Invalid depth value detected: {alt_data}. Using default altitude 0.")
                     alt = 0
             except (KeyError, IndexError, TypeError):
-                # Altitude sensor not available or invalid, use default
+                # Depth sensor not available or invalid, use default
                 pass
 
             if lat is not None and lon is not None:

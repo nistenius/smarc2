@@ -9,6 +9,15 @@
 
   <exec_depend>py_trees</exec_depend>
   <exec_depend>py_trees_ros</exec_depend>
+  <!-- Declared 2026-08-17 with A_SurfaceAndReport, which reads the GPS fix, the last
+       commanded waypoint and the protective stop. These were already imported transitively
+       through the action base; naming them is what makes a fresh workspace build in the
+       right order instead of by luck. sam_farm_inspection is deliberately NOT here: the
+       tree must come up on a hull with no farm code installed at all. -->
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>smarc_mission_msgs</exec_depend>
+  <exec_depend>smarc_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

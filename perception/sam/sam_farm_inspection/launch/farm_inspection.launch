@@ -32,6 +32,7 @@
          which is what an un-rebuilt Unity produces; the detector says on every health
          line which of the two it is using. -->
     <arg name="max_range_m" default="100.0"/>
+    <arg name="encircle_depth_override_m" default="-1.0"/>
 
     <node name="sss_farm_detector" pkg="sam_farm_inspection" exec="sss_farm_detector" output="screen">
         <param name="robot_name" value="$(var robot_name)"/>
@@ -44,6 +45,23 @@
         <param name="use_sim_time" value="$(var use_sim_time)"/>
         <param name="pose_topic" value="$(var pose_topic)"/>
         <param name="farm_prior_path" value="$(var farm_prior_path)"/>
+    </node>
+
+    <!-- The mission plan (P5, 2026-08-17). Answers the behaviour tree's
+         perception/farm/plan/request with one sub-goal, a phase-done or a NAMED refusal.
+         It holds no action client: every waypoint it produces is flown by the tree through
+         the one existing auv_depth_move_to client.
+
+         encircle_depth_override_m < 0 means "use the depth the prior derived", which is
+         what it should normally be. The prior works out the depth from which the buoys are
+         visible at all -- at Kristineberg that is the SURFACE, because a buoy only hangs
+         0.18-0.30 m below the water line and a side scan sees nothing at or above its own
+         depth. An override is re-checked and refused BY NAME if it would see nothing. -->
+    <node name="farm_planner" pkg="sam_farm_inspection" exec="farm_planner" output="screen">
+        <param name="robot_name" value="$(var robot_name)"/>
+        <param name="use_sim_time" value="$(var use_sim_time)"/>
+        <param name="farm_prior_path" value="$(var farm_prior_path)"/>
+        <param name="encircle_depth_override_m" value="$(var encircle_depth_override_m)"/>
     </node>
 
 </launch>
