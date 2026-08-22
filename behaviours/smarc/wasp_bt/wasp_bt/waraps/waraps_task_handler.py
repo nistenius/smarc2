@@ -975,6 +975,16 @@ class WaraPSTaskHandler:
             # change status of the current task to FINISHED
             self.tasks_executing[0]["status"] = WaraPSTaskStates.FINISHED.value
 
+            # FIX 2026-08-22 ("0/4 wp" on a COMPLETED 4-waypoint run): a finished task must
+            # land in `past_tasks`, exactly as an aborted one does. This is the NORMAL
+            # completion path (actions.py, all three call sites) and it used to pop the task
+            # into nowhere, while `move_task_to_past()` — the variant that does append — has
+            # zero callers. `_mission_progress()` edge-detects `past_tasks` growing, so a
+            # cleanly-flown mission counted nothing and the HUD's last-run summary claimed
+            # zero waypoints of a mission that finished. Observed on the rig 2026-08-22,
+            # run 15, the same flight that verified the timer retirement.
+            self.past_tasks.append(self.tasks_executing[0])
+
             self.tasks_executing.pop(0)
         else:
             # log
