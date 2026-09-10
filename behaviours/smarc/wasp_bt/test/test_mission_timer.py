@@ -48,7 +48,19 @@ except Exception:                                   # pragma: no cover
     src = (Path(__file__).resolve().parents[1] / "wasp_bt" / "waraps"
            / "waraps_task_handler.py").read_text()
     assert "def mission_timer_state" in src, "mission_timer_state has gone missing entirely"
-    ns = {}
+    # The shim's namespace must carry every NAME the extracted methods use, or the exec'd
+    # code raises at call time instead of import time -- which is worse, because it looks
+    # like a logic failure. `_mission_progress` started referencing `WaraPSTaskStates` on
+    # 2026-08-22 (counting FINISHED outcomes instead of list length) and the shim was never
+    # told; it went unnoticed only because the fixture passed `None`s, so the `isinstance`
+    # guard short-circuited before the name was ever evaluated. A stale fixture was hiding a
+    # broken shim. Built FROM THE SOURCE so it cannot drift from the enum again.
+    class _States:
+        pass
+    for _m in re.finditer(r'^\s+([A-Z_]+)\s*=\s*"([^"]+)"', src, re.M):
+        setattr(_States, _m.group(1), type("_V", (), {"value": _m.group(2)})())
+    assert hasattr(_States, "FINISHED"), "WaraPSTaskStates.FINISHED not found in the source"
+    ns = {"WaraPSTaskStates": _States}
     body = re.search(r"(    def _mission_progress.*?)\n    def _publish_mission_timer", src, re.S)
     exec("class _Shim:\n" + body.group(1), ns)
     MISSION_TIMER_STATE = ns["_Shim"].mission_timer_state
@@ -58,7 +70,7 @@ except Exception:                                   # pragma: no cover
 class Fake:
     """Just the attributes the clock reads."""
     def __init__(self, start=None, timeout=None, now=0.0, wp_total=0, past=0, base=0,
-                 emergency=False):
+                 emergency=False, finished=None):
         self.mission_start_time = start
         self.mission_timeout = timeout
         # 2026-08-19: the clock now reports whether the limit it is showing is actually being
@@ -66,15 +78,42 @@ class Fake:
         self.emergency_flag = emergency
         self._now = now
         self._mission_wp_total = wp_total
-        self.past_tasks = [None] * past
+        # 2026-08-29: was `[None] * past`, which stopped meaning anything when
+        # `_mission_progress` changed on 2026-08-22 to COUNT OUTCOMES rather than list length
+        # -- the abort paths drain unflown tasks into `past_tasks` too, so length counted
+        # waypoints the vehicle never flew (rig run 15: aborted after wp 1, HUD said "4/4 wp").
+        # A `None` is not a finished task, so the new code correctly scored 0 and four tests in
+        # this file went red against a fix that was right. THE FIXTURE WAS THE STALE COPY, not
+        # the code. It now builds what `past_tasks` actually holds.
+        #
+        # `finished` exists so a test can put UNFINISHED history in the slice -- which is the
+        # whole point of the change and had no coverage here at all.
+        # The status strings are LITERALS here, not `WaraPSTaskStates.FINISHED.value`,
+        # because this whole file exists to run WITHOUT the ROS message universe -- importing
+        # the handler is exactly what the shim above works around, and reaching for the enum
+        # inside the fixture re-broke every test in the file. `_STATUS_LITERALS_MATCH` below
+        # pins them to the source so the shortcut cannot rot silently.
+        n_fin = past if finished is None else finished
+        self.past_tasks = ([{"status": "finished"} for _ in range(n_fin)]
+                           + [{"status": "aborted"} for _ in range(past - n_fin)])
         self._mission_past_base = base
         self._mission_wp_done_seen = 0
         self._mission_last_wp_at = start
         self._last_mission_summary = {"last_elapsed_s": None, "last_limit_s": None,
                                       "last_wp_done": None, "last_wp_total": None}
+        # 2026-09-09, the adaptive close inspection: the clock now also reports how much of
+        # the limit was bought by sanctioned diversions, and which phase the vehicle is in.
+        # Both are ADDITIVE FIELDS on the same JSON -- not new `state` words -- so the Unity
+        # dashboard's minimal parser ignores them until it is taught to read them (§3s5).
+        self.mission_timeout_extension_s = 0.0
+        self._adaptive_diversion_latch = None
 
     def current_time(self):
         return self._now
+
+    def adaptive_phase(self):
+        latch = getattr(self, "_adaptive_diversion_latch", None)
+        return getattr(latch, "phase", "scan") if latch is not None else "scan"
 
     state = MISSION_TIMER_STATE
     _mission_progress = MISSION_PROGRESS
@@ -200,3 +239,22 @@ def test_the_summary_is_flat_so_the_hud_parser_needs_no_nesting():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_STATUS_LITERALS_MATCH_the_enum():
+    """The fixture writes `"finished"` / `"aborted"` as literals (it cannot import the enum
+    without ROS). Pin them to the source, so renaming a state fails HERE rather than making
+    every progress test quietly measure nothing."""
+    src = (Path(__file__).resolve().parents[1] / "wasp_bt" / "waraps"
+           / "waraps_task_handler.py").read_text()
+    assert 'FINISHED = "finished"' in src, "FINISHED's value moved; the fixture is now lying"
+    assert 'ABORTED = "aborted"' in src, "ABORTED's value moved; the fixture is now lying"
+
+
+def test_unfinished_history_in_the_slice_is_not_counted_as_progress():
+    """The 2026-08-22 change, which had no coverage: the abort paths drain UNFLOWN tasks into
+    `past_tasks`, so counting length reported waypoints the vehicle never flew (rig run 15 —
+    aborted after wp 1, HUD said 4/4)."""
+    n = Fake(start=0.0, timeout=1000.0, now=100.0, wp_total=4, past=4, base=0, finished=1)
+    s = n.state()
+    assert s["wp_done"] == 1, "aborted leftovers are being counted as flown waypoints again"

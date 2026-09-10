@@ -1,6 +1,6 @@
 from typing import Type
 from rclpy.node import Node
-from std_msgs.msg import String, Int8, Empty
+from std_msgs.msg import String, Int8, Empty, Float32
 from smarc_msgs.msg import Topics
 from wasp_bt.vehicles.sensor import Sensor, SensorNames
 import json
@@ -147,6 +147,28 @@ class WaraPSTaskHandler:
         self.mission_start_time = None
         self.mission_timeout = None
 
+        # THE ADAPTIVE BLOCK (2026-09-09). `params.adaptive` on the TST root, when the mission
+        # carries one. `None` means the mission does not carry one, and that is an ANSWER: a
+        # vehicle receiving a mission with no adaptive block runs a plain lawnmower, and the
+        # absence is never replaced by a default policy. Said ONCE per mission in the log,
+        # because a line per candidate would be noise.
+        self.adaptive_policy = None
+        self._adaptive_said_absent = False
+        # Seconds a SANCTIONED diversion consumed, added to the mission limit so a good
+        # inspection can never be how a good mission dies (SETTLED §3p's rule). Reported as an
+        # ADDITIVE FIELD on ctrl/mission_timer, never as a new `state` word -- the Unity
+        # dashboard scrapes that JSON with a deliberately minimal parser and an unknown KEY is
+        # ignored while an unknown `state` renders as nothing at all (§3s5).
+        self.mission_timeout_extension_s = 0.0
+        # The vehicle's own last known position, for recording the diversion point. Read from
+        # the estimator's geographic output; NOT computed here and never guessed. A diversion
+        # with no P0 is refused, because there would be nowhere to resume to (strategy §8).
+        self._last_lat = None
+        self._last_lon = None
+        self._last_depth = None
+        self._last_course = None
+        self._last_pose_at = None
+
         self.mission_status = None
 
         self.mission_command = None
@@ -209,6 +231,27 @@ class WaraPSTaskHandler:
 
         # subscribe to smarc health topic
         self._vehicle_health_sub = node.create_subscription(Int8, Topics.VEHICLE_HEALTH_TOPIC, self._vehicle_health_cb, 10)
+
+        # ADAPTIVE CLOSE INSPECTION (2026-09-09), all additive and all relative-topic so a
+        # second vehicle gets its own without any string surgery.
+        #
+        # The phase word goes out on its own plain String as well as inside the mission-timer
+        # JSON. Two channels for one word is deliberate: the JSON is what a dashboard already
+        # parses, and the String is what the bridge forwards to the station as a declared status
+        # field without having to parse anything.
+        self._adaptive_phase_pub = node.create_publisher(String, "ctrl/adaptive_phase", 10)
+        try:
+            from geographic_msgs.msg import GeoPoint
+            self._dr_latlon_sub = node.create_subscription(
+                GeoPoint, "dr/lat_lon", self._dr_latlon_cb, 10)
+        except ImportError:                     # pragma: no cover - a hull without geographic_msgs
+            self._dr_latlon_sub = None
+            self._node.get_logger().warn(
+                "geographic_msgs is not importable, so dr/lat_lon cannot be read and no "
+                "diversion point can be recorded. Adaptive diversions will refuse by name "
+                "rather than resume to a guessed position.")
+        self._depth_sub = node.create_subscription(Float32, "smarc/depth", self._depth_cb, 10)
+        self._course_sub = node.create_subscription(Float32, "smarc/course", self._course_cb, 10)
 
 
         if "direct_execution" in self._wara_ps_dict["levels"]:
@@ -310,6 +353,7 @@ class WaraPSTaskHandler:
         # Published EVERY tick, including when no mission is running: a consumer must be able to
         # tell "no mission" from "this node has stopped talking". Absent is not empty.
         self._publish_mission_timer()
+        self._publish_adaptive_phase()
 
         # A FINISHED MISSION STOPS BEING TIMED, WHATEVER ELSE IS TRUE (2026-08-19, measured).
         #
@@ -828,6 +872,25 @@ class WaraPSTaskHandler:
             # set mission command
             self.mission_command = command
 
+            # THE ADAPTIVE BLOCK, read from the TST root's own `params` (2026-09-09).
+            # PRESENCE RULE (SETTLED §3d): the key is there or it is not, and its absence means
+            # this mission is a plain lawnmower. Nothing is defaulted, and the absence is said
+            # ONCE rather than per candidate.
+            root_params = tst.get("params") if isinstance(tst.get("params"), dict) else {}
+            adaptive = root_params.get("adaptive")
+            self.adaptive_policy = dict(adaptive) if isinstance(adaptive, dict) else None
+            self._adaptive_said_absent = False
+            self.mission_timeout_extension_s = 0.0
+            if self.adaptive_policy is None:
+                self._node.get_logger().info(
+                    "this mission carries no `adaptive` block, so no diversion policy exists "
+                    "and the vehicle flies the operator's plan unchanged. Target detectors, if "
+                    "running, still record candidates; nothing diverts.")
+            else:
+                self._node.get_logger().info(
+                    f"adaptive close inspection ENABLED for this mission: "
+                    f"{sorted(self.adaptive_policy)}")
+
             # extract the mission timeout from "params" key in tst
             params = tst.get("params")
             if isinstance(params, dict) and "timeout" in params:
@@ -937,6 +1000,100 @@ class WaraPSTaskHandler:
 
         return        
     
+    # ---------------------------------------------------------------- adaptive close inspection
+    def _dr_latlon_cb(self, msg):
+        self._last_lat, self._last_lon = float(msg.latitude), float(msg.longitude)
+        self._last_pose_at = self.current_time()
+
+    def _depth_cb(self, msg):
+        self._last_depth = float(msg.data)
+
+    def _course_cb(self, msg):
+        # COURSE OVER GROUND, not heading. Near a steel car the compass is unreliable by
+        # construction (memory `heading_observability_strategy`), and the leg heading recorded
+        # in the diversion point is what the vehicle must re-enter the line on.
+        self._last_course = float(msg.data)
+
+    def get_adaptive_policy(self):
+        """The mission's `adaptive` block, or None.
+
+        None is an ANSWER, not a missing value: a mission with no adaptive block runs a plain
+        lawnmower and the detectors' candidates are recorded rather than acted on. Never
+        substitute a default policy here -- that would make every mission adaptive because one
+        was.
+        """
+        return self.adaptive_policy
+
+    def diversion_point(self):
+        """P0: where the mission is being interrupted, as a dict, or None with nothing invented.
+
+        None when the estimator has said nothing, or nothing recently. A diversion with no P0 is
+        refused by the behaviour that asked, because resuming "there" would be a transit across
+        the sea -- the same rule `A_SurfaceAndReport._surface_position` follows.
+        """
+        if self._last_lat is None or self._last_lon is None:
+            return None
+        age = None if self._last_pose_at is None else self.current_time() - self._last_pose_at
+        if age is not None and age > 5.0:
+            return None
+        return {"lat": self._last_lat, "lon": self._last_lon,
+                "depth_m": self._last_depth if self._last_depth is not None else 0.0,
+                "leg_heading_deg": self._last_course if self._last_course is not None else 0.0,
+                "leg_id": self.current_leg_id(),
+                "t": self.current_time()}
+
+    def current_leg_id(self):
+        """Which leg of the mission is executing, counted from the start of THIS mission.
+
+        `past_tasks` accumulates across missions, so the baseline taken when this mission was
+        accepted is what makes the number mean "leg 2 of this run" rather than "the 47th task
+        this vehicle has ever flown".
+        """
+        if not self.tasks_executing:
+            return None
+        return max(0, len(self.past_tasks) - self._mission_past_base)
+
+    def extend_mission_timeout(self, seconds, reason: str = "") -> float:
+        """Add the seconds a sanctioned diversion consumed to the mission limit.
+
+        SETTLED §3p's rule, applied: the limit exists to catch a plan that needs more time than
+        it was given, not to punish a vehicle for doing what the mission asked. The extension is
+        what the diversion ACTUALLY consumed -- measured -- never the budget it was allowed.
+
+        Returns the new limit, or the old one when there is nothing to extend. An UNTIMED
+        mission is not made timed by a diversion.
+        """
+        try:
+            secs = float(seconds)
+        except (TypeError, ValueError):
+            return 0.0
+        if secs <= 0.0 or not self.mission_timeout:
+            return float(self.mission_timeout or 0.0)
+        self.mission_timeout = float(self.mission_timeout) + secs
+        self.mission_timeout_extension_s += secs
+        self._node.get_logger().info(
+            f"mission timeout extended by {secs:.0f} s ({reason or 'unstated'}); the limit is "
+            f"now {self.mission_timeout:.0f} s. A sanctioned diversion may not be how a good "
+            f"mission dies.")
+        return float(self.mission_timeout)
+
+    def adaptive_phase(self) -> str:
+        """The one word that crosses the acoustic link: scan | divert | inspect | verify | resume.
+
+        Read off the latch that lives on THIS OBJECT (`target_inspection_core.get_or_create`),
+        because the behaviour-tree subtree holding the diversion is rebuilt whenever an action
+        server's heartbeat changes (SETTLED §3f0p). `scan` when there is no latch at all --
+        which is the truth: the vehicle is flying its plan.
+        """
+        latch = getattr(self, "_adaptive_diversion_latch", None)
+        return getattr(latch, "phase", "scan") if latch is not None else "scan"
+
+    def _publish_adaptive_phase(self):
+        try:
+            self._adaptive_phase_pub.publish(String(data=self.adaptive_phase()))
+        except Exception:   # pragma: no cover -- a diagnostic must never break the tree
+            pass
+
     def _vehicle_health_cb(self, data: Int8):
         """
         This method is called when a new vehicle health message is received.
@@ -1171,7 +1328,16 @@ class WaraPSTaskHandler:
             return {"wp_total": None, "wp_done": None, "wp_current": None,
                     "eta_finish_s": None, "eta_next_s": None}
         try:
-            done = max(0, len(self.past_tasks) - self._mission_past_base)
+            # COUNT OUTCOMES, NOT LENGTH (2026-08-22, second correction in two days — the first
+            # made finished tasks land in past_tasks at all). The ABORT paths drain every
+            # remaining queued task into past_tasks too (signal-tst/signal-task handlers, and
+            # start-tst replacing a stale queue), so len() counts waypoints the vehicle never
+            # flew: Ivan aborted after wp 1 and the HUD said "4/4 wp". Only a task whose status
+            # says FINISHED was actually completed; everything else in the slice is history,
+            # not progress.
+            done = sum(1 for t in self.past_tasks[self._mission_past_base:]
+                       if isinstance(t, dict)
+                       and t.get("status") == WaraPSTaskStates.FINISHED.value)
         except (TypeError, AttributeError):
             return {"wp_total": total, "wp_done": None, "wp_current": None,
                     "eta_finish_s": None, "eta_next_s": None}
@@ -1216,6 +1382,8 @@ class WaraPSTaskHandler:
             # the operator loses the one summary of the run that just finished.
             return {"state": "idle", "elapsed_s": None, "limit_s": None,
                     "remaining_s": None, "fraction": None,
+                    "extended_s": round(self.mission_timeout_extension_s, 1),
+                    "adaptive_phase": self.adaptive_phase(),
                     "wp_total": None, "wp_done": None, "wp_current": None,
                     "eta_finish_s": None, "eta_next_s": None,
                     "emergency": bool(self.emergency_flag),
@@ -1224,7 +1392,9 @@ class WaraPSTaskHandler:
         prog = self._mission_progress(now, elapsed)
         if not self.mission_timeout:
             return {"state": "untimed", "elapsed_s": round(elapsed, 1), "limit_s": None,
-                    "remaining_s": None, "fraction": None, **prog,
+                    "remaining_s": None, "fraction": None,
+                    "extended_s": round(self.mission_timeout_extension_s, 1),
+                    "adaptive_phase": self.adaptive_phase(), **prog,
                     "emergency": bool(self.emergency_flag),
                     **self._last_mission_summary}
         limit = float(self.mission_timeout)
@@ -1248,6 +1418,13 @@ class WaraPSTaskHandler:
             # has not yet been acted on, and "-4 s" is exactly the thing worth seeing.
             "remaining_s": round(remaining, 1),
             "fraction": round(elapsed / limit, 3) if limit > 0 else None,
+            # TWO ADDITIVE FIELDS, NOT NEW `state` WORDS (2026-09-09), for the same reason
+            # `emergency` above is a field: the Unity dashboard's minimal parser ignores an
+            # unknown KEY and renders an unknown `state` as nothing at all (§3s5).
+            # `extended_s` is how much of `limit_s` was bought by sanctioned diversions, so a
+            # reader can tell a plan that needed longer from a plan that was interrupted.
+            "extended_s": round(self.mission_timeout_extension_s, 1),
+            "adaptive_phase": self.adaptive_phase(),
             **prog,
             **self._last_mission_summary,
         }

@@ -191,6 +191,60 @@ def _build_mpc_trajectory_tracking(node, rates: Rates) -> Components:
                       dive_sub=dive_sub, convenience_pub=convenience_pub)
 
 
+def _build_mpc_and_pid_wp_following(node, rates: Rates) -> Components:
+    """BOTH SERVERS, ONE `DivePub`, BEHIND AN ARBITER — option M1 of strategy §5.3.
+
+    WHY IT EXISTS. The close-inspection orbit wants the ordinary lawnmower legs on
+    `auv_depth_move_to` (the PID/blend waypoint server the team flies) AND the turbo-turn ring
+    on `auv_trajectory_tracking` (the MPC, which is the group's published method and has run on
+    the real Orin). `diving_node` has only ever run ONE controller family per bringup, so this
+    is the first time the two would share a process — and sharing a process means sharing a
+    writer, which is ADR-004 invariant 12's question.
+
+    `OneWriterArbiter` is the answer: exactly one server may hold the writer at a time, the
+    other is REFUSED BY NAME, and the refusal says who is holding it and for how long. It is
+    pure python and is driven exhaustively in
+    `test/test_one_writer_across_the_two_servers.py`.
+
+    **NOT A DEFAULT, AND NOT FLOWN.** No launch file references this entry point, nothing on the
+    hull or the rig calls it, and this session did not run it: acados is not installed on this
+    machine and is UNMEASURED on vm1 (SETTLED §3ad), so the MPC half cannot even be imported
+    here. The import is therefore inside the function, exactly as `mpc_wp_following` does it,
+    and the REFUSAL is what an operator gets on a machine without acados rather than an
+    ImportError from somewhere confusing. Whether the two families can actually share a process
+    is rung R1 and is measured, not argued.
+    """
+    from .controllers.DiveControllerMPC import DiveControllerMPC
+    from .one_writer_arbiter import OneWriterArbiter
+
+    param = DivingModelParam(node).get_param()
+    action_type = ActionType(BaseAction)
+    heartbeat_topic = SMaRCTopics.WARA_PS_ACTION_SERVER_HB_TOPIC
+
+    arbiter = OneWriterArbiter(("auv_depth_move_to", "auv_trajectory_tracking"),
+                               now=lambda: node.get_clock().now().nanoseconds * 1e-9)
+
+    wp_server = DiveActionServerSub(node, "auv_depth_move_to", action_type, param,
+                                    heartbeat_topic)
+    mpc_server = MPCPathServer(node, "auv_trajectory_tracking", action_type, param)
+    # ONE DivePub. That is the whole point: two publishers on one actuator path is the state the
+    # arbiter exists to make impossible, and building a second one here would make the arbiter
+    # decorative.
+    dive_pub = DivePub(node, wp_server, param)
+    for srv in (wp_server, mpc_server):
+        setattr(srv, "one_writer_arbiter", arbiter)
+    node.get_logger().info(
+        "mpc_and_pid_wp_following: BOTH auv_depth_move_to and auv_trajectory_tracking are "
+        "served from this process, over ONE DivePub, behind a one-writer arbiter. UNFLOWN — "
+        "no launch file references this entry point (strategy §5.3 M1, rung R1).")
+
+    dive_controller = DiveControllerMPC(node, dive_pub, mpc_server, param,
+                                        ref_is_trajectory=True, rate=rates.dive_controller)
+    convenience_pub = ConveniencePub(node, wp_server, dive_controller)
+    return Components(dive_pub=dive_pub, dive_controller=dive_controller,
+                      dive_sub=wp_server, convenience_pub=convenience_pub)
+
+
 # --- Console-script entry points (module-level functions) ---
 def main():
     run_mode(node_name="DivingNode", build=_build_main)
@@ -232,3 +286,9 @@ def mpc_trajectory_tracking():
     run_mode(node_name="MpcTrajectoryTracking",
              build=_build_mpc_trajectory_tracking,
              log_banner="MPC Trajectory tracking")
+
+def mpc_and_pid_wp_following():
+    """Option M1 (strategy §5.3). ADDITIVE, NON-DEFAULT, REFERENCED BY NO LAUNCH FILE."""
+    run_mode(node_name="MpcAndPidWpFollowingNode",
+             build=_build_mpc_and_pid_wp_following,
+             log_banner="MPC + PID waypoint following, one writer (UNFLOWN)")

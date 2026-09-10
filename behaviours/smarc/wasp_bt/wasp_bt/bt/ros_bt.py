@@ -36,7 +36,8 @@ from .conditions import C_TaskIs,\
                         C_VehicleHealthStatus,\
                         C_HealthNodeAlive,\
                         C_HasHeardFromVehicleHealth,\
-                        C_MissionNotInError
+                        C_MissionNotInError,\
+                        C_MissionJustEnded
 
 from .actions import A_Abort,\
                      A_Heartbeat,\
@@ -48,7 +49,10 @@ from .actions import A_Abort,\
                     A_WaitForData,\
                     A_ClearCurrentTask
 
-from .farm_inspection import A_FarmInspection, A_SurfaceAndReport, FARM_INSPECTION_TASK
+from .farm_inspection import (A_FarmInspection, A_SurfaceAndReport,
+                              A_EndOfMissionSurface, FARM_INSPECTION_TASK)
+from .target_inspection import (A_CloseInspection, A_ResumeAtDiversionPoint,
+                                C_TargetCandidatePending)
 
 class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
     def __init__(self,
@@ -261,6 +265,55 @@ class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
         return ready_tree
 
 
+    def _target_inspection_tree(self, action_client: BTActionClient):
+        """The adaptive close inspection, as a HIGHER-PRIORITY SIBLING of the mission tree.
+
+        THIS IS THE PREEMPTION, and it is the whole reason the subtree sits where it sits.
+        `F_Task_Handler` is a Fallback with `memory=False`, so its children are re-evaluated in
+        priority order on every tick. The moment `C_TargetCandidatePending` succeeds, this
+        subtree returns RUNNING, py_trees invalidates everything below it — including the
+        `A_ActionClient` flying the operator's waypoint — and terminates it with
+        `Status.INVALID`. `smarc_action_base/bt_action_client_action.py:110-136` handles exactly
+        that ("Preempted by higher priority in tree, cancelling goal") and then calls
+        `get_ready()`, so when this subtree stops matching the task tree ticks again,
+        `initialise()` re-sends the goal from `get_current_task_params()` — the same waypoint,
+        still `tasks_executing[0]`, still queued.
+
+        THE PATH THAT MUST NOT BE USED, measured 2026-09-09 (SETTLED §3ad and its correction):
+        cancelling the goal from inside the inspection behaviour. `actions.py:322-534` lists
+        `ActionClientState.CANCELLED` among `A_ActionClient`'s FAILURE states; driven, that value
+        is intercepted at the top of `update()` (`get_ready()`, RUNNING) so a clean side-cancel
+        does NOT delete the leg — but a cancel that FAILS lands the client in `REJECTED`, which
+        DOES reach the failure branch and `clear_current_task()`, and the lawnmower silently loses
+        a waypoint. Preemption by tree priority never depends on how a cancel resolves.
+
+        `Fallback([A_CloseInspection, Success])`: an inspection that REFUSES must still fly the
+        resume legs. A refusal is a mission phase ending, not a reason to leave the vehicle at
+        the ring; the refusal itself is already reported by the behaviour and recorded on the
+        latch as `not_inspected` with its reason.
+
+        `memory=True` on the phase sequence, as `_bt_provided_task_tree` uses it and for the
+        same reason: these are SEQUENTIAL PHASES of one diversion, not a re-evaluated guard
+        chain. `memory=False` on the outer sequence, so the mission-error gate and the latch are
+        re-read every tick and a cleared latch drops this subtree out of the way immediately.
+        """
+        robot_name = self._task_handler.wara_ps_dict["name"]
+        node = self._task_handler._node
+        return Sequence("S_TargetInspection", memory=False, children=[
+            C_MissionNotInError(self._task_handler),
+            # The policy gate is inside this condition: it only latches a candidate when the
+            # mission carried an `adaptive` block, so a mission without one can never divert.
+            C_TargetCandidatePending(self._task_handler, node, robot_name),
+            Sequence("S_TargetInspection_phases", memory=True, children=[
+                Fallback("F_InspectOrResumeAnyway", memory=False, children=[
+                    A_CloseInspection(action_client, self, self._task_handler, node, robot_name),
+                    Success(name="A_InspectionRefused_ResumeAnyway"),
+                ]),
+                A_ResumeAtDiversionPoint(action_client, self, self._task_handler, node,
+                                         robot_name),
+            ]),
+        ])
+
     def _task_handler_tree(self, action_client_list: typing.List[BTActionClient] = None):
         """
         Fallback root node, connecting together sequences of {is the current action a certain kind of action? If so, run the corresponding action server}
@@ -368,8 +421,54 @@ class BT(HasVehicleContainer, HasClock, HasWaraPSTaskHandler):
         mission_tree = Sequence("S_Mission", memory=False, children=mission_children)
 
 
+        # THE ADAPTIVE CLOSE INSPECTION GOES IN AHEAD OF THE MISSION TREE (2026-09-09).
+        #
+        # Order IS the mechanism (see `_target_inspection_tree`): a Fallback child listed before
+        # `S_Mission` has higher priority, and py_trees' own invalidation is what preempts the
+        # running waypoint goal. Appending it after the mission tree would make it unreachable
+        # while any task matched, which is every moment of a mission.
+        #
+        # It is built only when there is a client to stream through — the SAME cached client the
+        # ordinary `auv-depth-move-to` task uses. One client, one server (SETTLED §1c).
+        if action_client_list:
+            task_children.append(self._target_inspection_tree(action_client_list[0]))
+
         # add the mission tree to task handler
         task_children.append(mission_tree)
+
+        # INVARIANT 5b, THE ORDINARY PATH (2026-08-29). Between "the mission stopped matching"
+        # and "idle" there is one thing the vehicle owes: coming up.
+        #
+        # `A_SurfaceAndReport` has existed since 2026-08-17 but only inside the
+        # `auv-farm-inspection` subtree. Every OTHER mission -- every plain waypoint run --
+        # ended by falling straight through to `A_Chilling` with the diving controller still
+        # holding its last commanded depth, indefinitely. Recovery needs the vehicle visible,
+        # and surfacing is how it resets accumulated DR error.
+        #
+        # It also silently broke recording: `bridge_node`'s end-of-run rule needs *mission
+        # ended AND SURFACED AND idle*, where "surfaced" is the controller's own
+        # `ctrl/neutral_handoff` verdict and not a depth reading. No verdict, no grace, no
+        # stop -- so the bag was never closed and never had a `metadata.yaml`. Seen twice on
+        # 2026-08-29, and the hand workaround (killing the recorder) destroyed a flown mission,
+        # because `bridge_node` owns that recorder and restarts it on the same path.
+        #
+        # Ordering is the safety argument. This sits AFTER the mission tree, so it is reached
+        # only when no task matches; the condition is an EDGE (a mission ran, then stopped), so
+        # a vehicle that has never flown does not blow its tank on power-up; and it latches on
+        # the TASK HANDLER, which outlives the rebuilds this subtree undergoes whenever an
+        # action server's heartbeat changes. Once attempted -- confirmed, timed out, or held by
+        # the protective stop -- it stops matching and idle resolves to `A_Chilling` as before.
+        #
+        # `memory=True`: the two children are sequential phases of one recovery, not a
+        # re-evaluated guard chain. Same reason `_bt_provided_task_tree` uses it.
+        if action_client_list:
+            surface_client = action_client_list[0]
+            robot_name = self._task_handler.wara_ps_dict["name"]
+            task_children.append(Sequence("S_EndOfMissionSurface", memory=True, children=[
+                C_MissionJustEnded(self._task_handler),
+                A_EndOfMissionSurface(surface_client, self, self._task_handler,
+                                      self._task_handler._node, robot_name),
+            ]))
 
         # add the chill task. THIS one is genuine idle -- the resting state of a healthy vehicle
         # with no mission, and the tip the mission gate looks for before an upload (#29).

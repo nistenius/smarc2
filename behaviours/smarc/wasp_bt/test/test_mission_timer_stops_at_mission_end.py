@@ -83,6 +83,9 @@ class Fake:
         self.aborts = []
         self.ABORT_ORIGIN_MISSION_TIMEOUT = ABORT_ORIGIN_MISSION_TIMEOUT
         self.timer_published = 0
+        # 2026-09-09, the adaptive close inspection: the level-3 heartbeat now also publishes
+        # the phase word beside the timer. Recorded here, not sent, like everything else.
+        self.phase_published = 0
         self._direct_execution_info_data = {}
         self._wara_ps_dict = {"agent-uuid": "u"}
         self._node = types.SimpleNamespace(
@@ -96,6 +99,9 @@ class Fake:
 
     def _publish_mission_timer(self):
         self.timer_published += 1
+
+    def _publish_adaptive_phase(self):
+        self.phase_published += 1
 
     def _apply_abort(self, origin, detail, respond=False, respond_to=None):
         self.aborts.append((origin, detail))

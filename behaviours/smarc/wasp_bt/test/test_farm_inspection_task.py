@@ -400,7 +400,7 @@ def _install_stubs():
     for root in _RosNamespaceFinder.ROOTS:
         sys.modules.setdefault(root, _PermissiveModule(root))
     _stub("rclpy.node", Node=object)
-    _stub("std_msgs.msg", String=_Msg, Int8=_Msg, Empty=_Msg)
+    _stub("std_msgs.msg", String=_Msg, Int8=_Msg, Empty=_Msg, Float32=_Msg)
     _stub("std_srvs.srv", Trigger=MagicMock())
 
     class _TopicsMeta(type):

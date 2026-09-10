@@ -34,7 +34,7 @@ def _install_stubs():
     _stub("rclpy")
     _stub("rclpy.node", Node=object)
     _stub("std_msgs")
-    _stub("std_msgs.msg", String=_Msg, Int8=_Msg, Empty=_Msg)
+    _stub("std_msgs.msg", String=_Msg, Int8=_Msg, Empty=_Msg, Float32=_Msg)
     _stub("std_srvs")
     _stub("std_srvs.srv", Trigger=MagicMock())
 

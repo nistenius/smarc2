@@ -45,6 +45,9 @@ setup(
             "pid_trajectory_tracking = sam_diving_controller.entrypoints:pid_trajectory_tracking",
             "mpc_wp_following = sam_diving_controller.entrypoints:mpc_wp_following",
             "mpc_trajectory_tracking = sam_diving_controller.entrypoints:mpc_trajectory_tracking",
+            # 2026-09-09, strategy §5.3 option M1. ADDITIVE: registered so it can be run by hand,
+            # referenced by NO launch file, and no default changed. UNFLOWN.
+            "mpc_and_pid_wp_following = sam_diving_controller.entrypoints:mpc_and_pid_wp_following",
         ],
     },
 )

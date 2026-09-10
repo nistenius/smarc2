@@ -109,7 +109,7 @@ def _install_stubs():
     for _root in _RosNamespaceFinder.ROOTS:
         _permissive(_root)
     _stub("rclpy.node", Node=object)
-    _stub("std_msgs.msg", String=_Msg, Int8=_Msg, Empty=_Msg)
+    _stub("std_msgs.msg", String=_Msg, Int8=_Msg, Empty=_Msg, Float32=_Msg)
     _stub("std_srvs.srv", Trigger=MagicMock())
 
     class Topics:

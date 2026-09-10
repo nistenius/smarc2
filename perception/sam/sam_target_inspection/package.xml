@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sam_target_inspection</name>
+  <version>0.0.1</version>
+  <description>
+    Adaptive close inspection of a proud seabed target: a side-scan target detector, a
+    forward-looking-sonar proud-object detector, the ledger that associates their candidates,
+    the inspection planner that answers "what next", and the capture recorder.
+
+    Sibling of `sam_farm_inspection` and built to the same discipline: pure-python cores that
+    are driven exhaustively off-vehicle, ROS shells that only subscribe, convert, publish and
+    report their own health. Detection runs on INTENSITIES and POINTS, never on the
+    simulator's material labels (SETTLED §3k) — labels appear in tests only.
+
+    It holds NO action client and writes NO actuator. The planner is a setpoint SOURCE
+    (ADR-004, invariant 12): it answers what the next sub-goal is, and the behaviour tree
+    streams that answer through the ONE existing `auv_depth_move_to` client.
+
+    Nothing in this package has been flown. Strategy:
+    data-cube/docs/2026-09-09-asko-adaptive-close-inspection-strategy.md
+  </description>
+  <maintainer email="stenius@kth.se">Ivan Stenius</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>smarc_msgs</depend>
+  <depend>sam_farm_inspection</depend>
+  <depend>tf2_ros_py</depend>
+  <depend>python3-numpy</depend>
+  <depend>python3-yaml</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
