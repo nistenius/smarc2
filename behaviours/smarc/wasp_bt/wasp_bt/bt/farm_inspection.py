@@ -243,3 +243,39 @@ class A_SurfaceAndReport(Behaviour):
         if step.action == FAILURE:
             return Status.FAILURE
         return Status.RUNNING
+
+
+class A_EndOfMissionSurface(A_SurfaceAndReport):
+    """`A_SurfaceAndReport` for the ORDINARY path — invariant 5b, finally closed (2026-08-29).
+
+    Identical behaviour to its parent; the only difference is that it tells the end-of-mission
+    latch it has finished, so the tree surfaces ONCE per mission and then resolves to
+    `A_Chilling` like any idle vehicle.
+
+    It is a subclass rather than a copy on purpose: the surfacing logic, the protective-stop
+    gate and the confirmed-vs-timeout distinction are the hard parts and they are already
+    written and tested (SurfaceAndReportCore). A second implementation of "how to surface"
+    would be a second thing to keep right.
+
+    ON THE MISSING TASK FEEDBACK, stated rather than discovered later: the parent publishes its
+    feedback to the CURRENT task, and at end of mission the queue is empty by definition, so
+    that call returns None and the WARA-PS task feedback channel says nothing. The report still
+    reaches an operator through the behaviour-tree tip (`feedback_message`, which MC and VC
+    read from `bt_status`) and through the node log. Nothing is silently dropped, but the
+    channel differs from the farm-task case and consumers should not expect a task feedback
+    message for an end-of-mission surfacing -- there is no task to attach it to.
+    """
+
+    def __init__(self, client: BTActionClient, bt, task_handler: WaraPSTaskHandler,
+                 node, robot_name: str):
+        super().__init__(client, bt, task_handler, node, robot_name)
+        self.name = "A_EndOfMissionSurface"
+        self._task_handler_ref = task_handler
+
+    def update(self) -> Status:
+        status = super().update()
+        if status in (Status.SUCCESS, Status.FAILURE):
+            from .end_of_mission_core import get_or_create
+            get_or_create(self._task_handler_ref).note_surface_finished(
+                getattr(self._core, "outcome", None))
+        return status

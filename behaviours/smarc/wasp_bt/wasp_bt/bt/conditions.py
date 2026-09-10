@@ -304,3 +304,36 @@ class C_HasHeardFromVehicleHealth(Behaviour):
         else:
             self.feedback_message = "Waiting for vehicle health to be published..."
             return Status.RUNNING
+
+
+class C_MissionJustEnded(Behaviour):
+    """SUCCESS on the tick after the task queue empties, for a mission that actually RAN.
+
+    Invariant 5b's trigger for the ORDINARY path. `A_SurfaceAndReport` has existed since
+    2026-08-17 but only inside the `auv-farm-inspection` subtree, so a plain waypoint mission
+    ends by falling through to `A_Chilling` with the diving controller still holding depth.
+
+    THIS IS AN EDGE, NOT A LEVEL, and the distinction is the whole safety of it: "the queue is
+    empty" is also true of a vehicle that has just been powered on and never flown anything,
+    and that vehicle must not blow its tank. The mission must have been seen to run and then
+    to stop. The latch lives on the task handler (see end_of_mission_core.get_or_create),
+    because `ros_bt._update_task_handler_tree` rebuilds this subtree whenever an action
+    server's heartbeat changes -- a flag on the behaviour would be erased at an arbitrary
+    moment mid-flight.
+
+    Placed in `F_Task_Handler` AFTER the mission tree and BEFORE `A_Chilling`, so it is
+    reached exactly when the mission tree stops matching, and idle still resolves to
+    `A_Chilling` once the surfacing has been attempted.
+    """
+    def __init__(self, task_handler: WaraPSTaskHandler):
+        self._task_handler = task_handler
+        super().__init__(f"{self.__class__.__name__}")
+        self.feedback_message = ""
+
+    def update(self) -> Status:
+        from .end_of_mission_core import get_or_create
+        core = get_or_create(self._task_handler)
+        executing = self._task_handler.get_executing_tasks() or []
+        core.note_executing(len(executing))
+        self.feedback_message = core.describe()
+        return Status.SUCCESS if core.should_surface() else Status.FAILURE
