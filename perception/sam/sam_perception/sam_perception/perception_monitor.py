@@ -29,7 +29,7 @@ WATCHED = {
 class PerceptionMonitor(Node):
     def __init__(self):
         super().__init__('perception_monitor')
-        self.declare_parameter('robot_name', 'sam_auv_v1')
+        self.declare_parameter('robot_name', 'sam21')
         self.declare_parameter('report_period_s', 5.0)
         robot = self.get_parameter('robot_name').value
         period = float(self.get_parameter('report_period_s').value)

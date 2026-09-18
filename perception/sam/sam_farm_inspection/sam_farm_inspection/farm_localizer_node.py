@@ -52,7 +52,7 @@ class FarmLocalizer(Node):
     def __init__(self):
         super().__init__("farm_localizer")
 
-        self.declare_parameter("robot_name", "sam_auv_v1")
+        self.declare_parameter("robot_name", "sam21")
         self.declare_parameter("detections_topic", "perception/farm/detections")
         # See the module docstring. `smarc/odom` and `core/odom_gt` are Unity's ground
         # truth in sim; using them makes the map correct by construction and proves

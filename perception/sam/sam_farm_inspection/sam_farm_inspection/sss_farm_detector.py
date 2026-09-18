@@ -32,7 +32,7 @@ WHAT IT DELIBERATELY DOES NOT DO
     the message is the publisher's own statement of the ping's extent, and the parameter
     is a named fallback that says out loud when it is being used.
 
-Run:  ros2 run sam_farm_inspection sss_farm_detector --ros-args -p robot_name:=sam_auv_v1
+Run:  ros2 run sam_farm_inspection sss_farm_detector --ros-args -p robot_name:=sam21
 """
 import json
 import math
@@ -54,7 +54,7 @@ class SssFarmDetector(Node):
     def __init__(self):
         super().__init__("sss_farm_detector")
 
-        self.declare_parameter("robot_name", "sam_auv_v1")
+        self.declare_parameter("robot_name", "sam21")
         self.declare_parameter("sidescan_topic", "payload/sidescan")
         # Near-field blanking, in metres of slant range. Transmit ring-down and the
         # vehicle's own hull produce an enormous change point at bin 0 that is not the

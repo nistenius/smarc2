@@ -14,7 +14,7 @@ and rate; this node BOUNDS ITSELF by the announced range and says so on its heal
 never commands a mode — the mission does that, at CLOSE-OPS entry and exit (the 2026-08-12
 decision: the mission knows when it is inspecting, the sonar does not).
 
-Run: ros2 run sam_target_inspection fls_target_detector --ros-args -p robot_name:=sam_auv_v1
+Run: ros2 run sam_target_inspection fls_target_detector --ros-args -p robot_name:=sam21
 """
 import json
 import math
@@ -46,7 +46,7 @@ class FlsTargetDetector(Node):
 
     def __init__(self):
         super().__init__("fls_target_detector")
-        self.declare_parameter("robot_name", "sam_auv_v1")
+        self.declare_parameter("robot_name", "sam21")
         self.declare_parameter("cloud_topic", "payload/sonar3d/points")
         # SAME NAME AND SAME REASON as the obstacle detector's: a surfaced hull sees itself
         # (SETTLED §3u). Declared separately rather than read from that node, because reading a

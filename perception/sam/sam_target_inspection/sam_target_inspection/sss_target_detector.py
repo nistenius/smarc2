@@ -21,7 +21,7 @@ WHAT IT DELIBERATELY DOES NOT DO
   * it does NOTHING while `payload/sidescan` is silent (ADR-010), and it measures its own
     per-ping cost and prints it on the health line.
 
-Run: ros2 run sam_target_inspection sss_target_detector --ros-args -p robot_name:=sam_auv_v1
+Run: ros2 run sam_target_inspection sss_target_detector --ros-args -p robot_name:=sam21
 """
 import json
 import time
@@ -54,7 +54,7 @@ class SssTargetDetector(Node):
 
     def __init__(self):
         super().__init__("sss_target_detector")
-        self.declare_parameter("robot_name", "sam_auv_v1")
+        self.declare_parameter("robot_name", "sam21")
         self.declare_parameter("sidescan_topic", "payload/sidescan")
         # Fallback only. 0.0 means "insist on the message's own max_duration".
         self.declare_parameter("max_range_m", 40.0)

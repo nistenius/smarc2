@@ -84,7 +84,7 @@ class ObstacleDetector(Node):
     def __init__(self):
         super().__init__("obstacle_detector")
 
-        self.declare_parameter("robot_name", "sam_auv_v1")
+        self.declare_parameter("robot_name", "sam21")
         # Body frame the sectors are computed in. See FRAMES note in the module
         # docstring: base_link_gt in sim (physically-correct ranges), base_link on
         # hardware (where the cloud is already sensor-frame).

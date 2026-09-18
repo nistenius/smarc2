@@ -19,7 +19,7 @@ directory as `inspection/<candidate_id>/`, with `frames.jsonl` and `scans.jsonl`
 record REJECTED frames too, with their reason: a rejected frame is a measurement of the water,
 and dropping it silently turns a coverage figure into a claim about the camera.
 
-Run: ros2 run sam_target_inspection inspection_recorder --ros-args -p robot_name:=sam_auv_v1
+Run: ros2 run sam_target_inspection inspection_recorder --ros-args -p robot_name:=sam21
 """
 import json
 import os
@@ -49,7 +49,7 @@ class InspectionRecorder(Node):
 
     def __init__(self):
         super().__init__("inspection_recorder")
-        self.declare_parameter("robot_name", "sam_auv_v1")
+        self.declare_parameter("robot_name", "sam21")
         self.declare_parameter("camera_topic", "payload/realsense/left/image_raw")
         self.declare_parameter("cloud_topic", "payload/sonar3d/points")
         self.declare_parameter("output_root", "")

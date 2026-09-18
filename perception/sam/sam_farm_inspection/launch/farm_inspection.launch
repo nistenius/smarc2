@@ -24,7 +24,7 @@
          The localizer refuses to start without it rather than substituting a built-in
          farm — an invented prior sends the mission confidently to the wrong place. -->
 
-    <arg name="robot_name" default="sam_auv_v1"/>
+    <arg name="robot_name" default="sam21"/>
     <arg name="use_sim_time" default="false"/>
     <arg name="pose_topic" default="dr/odom"/>
     <arg name="farm_prior_path" default=""/>

@@ -37,7 +37,7 @@ class FarmPlanner(Node):
 
     def __init__(self):
         super().__init__("farm_planner")
-        self.declare_parameter("robot_name", "sam_auv_v1")
+        self.declare_parameter("robot_name", "sam21")
         self.declare_parameter("farm_prior_path", "")
         self.declare_parameter("report_topic", "perception/farm/report")
         self.declare_parameter("rpm", 500.0)

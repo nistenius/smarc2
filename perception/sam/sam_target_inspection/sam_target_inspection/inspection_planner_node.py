@@ -15,7 +15,7 @@ behaviour tree streams that answer through the ONE existing `auv_depth_move_to` 
 `divert_request` topic is an ASK, not a command: the tree's own condition decides, and refuses
 when the mission carries no policy.
 
-Run: ros2 run sam_target_inspection inspection_planner --ros-args -p robot_name:=sam_auv_v1
+Run: ros2 run sam_target_inspection inspection_planner --ros-args -p robot_name:=sam21
 """
 import json
 import math
@@ -40,7 +40,7 @@ class InspectionPlannerNode(Node):
 
     def __init__(self):
         super().__init__("inspection_planner")
-        self.declare_parameter("robot_name", "sam_auv_v1")
+        self.declare_parameter("robot_name", "sam21")
         self.declare_parameter("policy_yaml", "")
         # The seabed depth under a candidate. The curated Askö terrain is 29 % gap-filled
         # (SETTLED §3f0), so a depth read from it is not a measurement everywhere; the vehicle's

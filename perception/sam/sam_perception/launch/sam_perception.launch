@@ -10,7 +10,7 @@
                               <robot>/payload/realsense/...      images + camera_info
                             NOTE: the hardware branch is written to spec but has NOT been
                             run against real units yet - verify remaps on first bench test. -->
-    <arg name="robot_name" default="sam_auv_v1"/>
+    <arg name="robot_name" default="sam21"/>
     <arg name="use_sim_time" default="false"/>
     <arg name="simulation" default="true"/>
     <arg name="sonar_ip" default="192.168.194.96"/>
